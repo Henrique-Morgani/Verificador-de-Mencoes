@@ -49,11 +49,21 @@ with st.sidebar:
             "Serper.dev (busca Google)", type="password",
             help="Crie em serper.dev. A conta gratuita vem com 2.500 buscas.",
         )
-    if not ahrefs_key:
+    if ahrefs_key:
+        st.success("Chave da Ahrefs configurada no servidor.")
+    else:
         ahrefs_key = st.text_input(
-            "Ahrefs API v3 (opcional)", type="password",
-            help="O DR usa o endpoint gratuito da Ahrefs. Sem chave funciona um a um; "
-                 "com a chave (a gratuita serve) consulta em lote.",
+            "Ahrefs API v3 (necessária para o DR)", type="password",
+            help="O endpoint de DR é gratuito (não gasta unidades), mas exige chave. "
+                 "Uma conta gratuita da Ahrefs serve: Account settings > API keys.",
+        )
+    hunter_key = segredo("HUNTER_API_KEY")
+    if hunter_key:
+        st.success("Chave do Hunter configurada no servidor.")
+    else:
+        hunter_key = st.text_input(
+            "Hunter.io (opcional, emails de jornalistas)", type="password",
+            help="Plano grátis com créditos mensais. Cada email de autor ou busca por veículo gasta 1 crédito.",
         )
 
     st.header("Busca")
@@ -70,7 +80,20 @@ with st.sidebar:
 
     st.header("O que puxar")
     puxar_dr = st.checkbox("DR (Ahrefs)", value=True)
-    puxar_contatos = st.checkbox("Meios de contato", value=True)
+    puxar_contatos = st.checkbox("Contatos do site (email, WhatsApp, redes, formulário)", value=True)
+
+    st.header("Jornalista / autor")
+    puxar_autor = st.checkbox("Identificar autor da matéria e sua página", value=True,
+                              help="Grátis. Lê o nome do autor e a página de autor do próprio site.")
+    perfis_google = st.checkbox("Buscar LinkedIn, X e Muck Rack do autor no Google", value=True,
+                                help="Gasta 1 crédito do Serper por autor.")
+    hunter_autor = st.checkbox("Hunter: descobrir email do autor", value=bool(hunter_key),
+                               disabled=not hunter_key, help="1 crédito do Hunter por autor.")
+    hunter_veiculo = st.checkbox("Hunter: emails da redação do veículo", value=False,
+                                 disabled=not hunter_key, help="1 crédito do Hunter por domínio.")
+    so_oportunidades = st.checkbox("Gastar créditos só com oportunidades", value=True,
+                                   help="Busca no Google e Hunter apenas para menções sem link "
+                                        "ou com link nofollow.")
 
     excluir_txt = st.text_area(
         "Domínios a excluir (um por linha)",
@@ -94,7 +117,8 @@ excluir = [d.strip() for d in excluir_txt.splitlines() if d.strip()]
 
 if termos and serper_key:
     custo = len(termos) * paginas * (2 if incluir_noticias else 1)
-    st.caption(f"Estimativa: até {custo} créditos do Serper nesta rodada.")
+    extra = " + 1 por autor encontrado" if (puxar_autor and perfis_google) else ""
+    st.caption(f"Estimativa: até {custo} créditos do Serper na busca{extra}.")
 
 rodar = st.button("Buscar menções", type="primary", disabled=not (url_cliente and termos and serper_key))
 if not serper_key:
@@ -107,13 +131,17 @@ if rodar:
         barra.progress(min(frac, 1.0), text=etapa)
 
     try:
-        linhas = core.executar(
+        linhas, avisos = core.executar(
             url_cliente=url_cliente, termos=termos, serper_key=serper_key, ahrefs_key=ahrefs_key,
-            pais=pais, idioma=idioma, paginas=paginas, periodo=periodo,
+            hunter_key=hunter_key, pais=pais, idioma=idioma, paginas=paginas, periodo=periodo,
             incluir_noticias=incluir_noticias, excluir=excluir,
-            puxar_dr=puxar_dr, puxar_contatos=puxar_contatos, progresso=progresso,
+            puxar_dr=puxar_dr, puxar_contatos=puxar_contatos, puxar_autor=puxar_autor,
+            perfis_google=perfis_google, hunter_autor=hunter_autor and bool(hunter_key),
+            hunter_veiculo=hunter_veiculo and bool(hunter_key), so_oportunidades=so_oportunidades,
+            progresso=progresso,
         )
         st.session_state["resultado"] = pd.DataFrame(linhas)
+        st.session_state["avisos"] = avisos
         st.session_state["cliente"] = core.normalizar_dominio(url_cliente)
     except Exception as e:
         st.error(f"Erro: {e}")
@@ -125,7 +153,8 @@ if df is not None:
         st.warning("Nenhuma menção encontrada com esses termos.")
         st.stop()
 
-    confirmadas = df[~df["status"].isin(["Termo não encontrado na página"])]
+    for aviso in st.session_state.get("avisos", []):
+        st.warning(aviso)
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("URLs encontradas", len(df))
     m2.metric("Domínios únicos", df["dominio"].nunique())
@@ -138,18 +167,25 @@ if df is not None:
     padrao = [s for s in status_opts if s != "Termo não encontrado na página"]
     filtro_status = f1.multiselect("Status", status_opts, default=padrao)
     dr_min = f2.number_input("DR mínimo", 0, 100, 0)
-    so_contato = f3.checkbox("Só com email ou WhatsApp")
+    so_contato = f3.checkbox("Só com algum email ou WhatsApp")
 
     vis = df[df["status"].isin(filtro_status)]
     if dr_min:
         vis = vis[vis["dr"].fillna(-1) >= dr_min]
-    if so_contato and "emails" in vis.columns:
-        vis = vis[(vis["emails"].fillna("") != "") | (vis["whatsapp"].fillna("") != "")]
+    if so_contato:
+        cols_ct = [c for c in ("emails", "whatsapp", "autor_email", "hunter_email_autor",
+                               "emails_veiculo_hunter") if c in vis.columns]
+        if cols_ct:
+            vis = vis[(vis[cols_ct].fillna("").astype(str) != "").any(axis=1)]
 
     colunas = [c for c in [
         "status", "dominio", "dr", "url", "titulo", "termos_encontrados", "anchors", "rel",
-        "emails", "telefones", "whatsapp", "redes_sociais", "tem_formulario", "paginas_contato",
-        "autor", "publicado_em", "data_google", "trecho_mencao", "urls_linkadas", "fonte",
+        "autor", "autor_email", "hunter_email_autor", "hunter_confianca", "hunter_cargo_autor",
+        "autor_linkedin", "autor_x", "autor_instagram", "autor_muckrack", "autor_pagina",
+        "buscar_autor_linkedin", "buscar_autor_muckrack",
+        "emails", "emails_veiculo_hunter", "telefones", "whatsapp", "redes_sociais",
+        "tem_formulario", "paginas_contato",
+        "publicado_em", "data_google", "trecho_mencao", "urls_linkadas", "fonte",
     ] if c in vis.columns]
 
     st.dataframe(
@@ -158,6 +194,14 @@ if df is not None:
         hide_index=True,
         column_config={
             "url": st.column_config.LinkColumn("URL"),
+            "autor_linkedin": st.column_config.LinkColumn("LinkedIn do autor"),
+            "autor_x": st.column_config.LinkColumn("X do autor"),
+            "autor_instagram": st.column_config.LinkColumn("Instagram do autor"),
+            "autor_muckrack": st.column_config.LinkColumn("Muck Rack do autor"),
+            "autor_pagina": st.column_config.LinkColumn("Página do autor"),
+            "buscar_autor_linkedin": st.column_config.LinkColumn("Buscar no LinkedIn", display_text="buscar"),
+            "buscar_autor_muckrack": st.column_config.LinkColumn("Buscar no Muck Rack", display_text="buscar"),
+            "hunter_confianca": st.column_config.NumberColumn("Confiança Hunter", format="%d%%"),
             "dr": st.column_config.NumberColumn("DR", format="%.0f"),
             "trecho_mencao": st.column_config.TextColumn("Trecho", width="large"),
         },
@@ -175,7 +219,7 @@ if df is not None:
             urls_com_dofollow=("links_dofollow", lambda s: int((s > 0).sum())),
             status=("status", lambda s: " | ".join(sorted(set(s)))),
         )
-        for c in ("emails", "whatsapp", "telefones", "redes_sociais"):
+        for c in ("emails", "emails_veiculo_hunter", "whatsapp", "telefones", "redes_sociais"):
             if c in df.columns:
                 agg[c] = (c, "first")
         resumo = (df.groupby("dominio").agg(**agg).reset_index()

@@ -182,6 +182,7 @@ class AnalisePagina:
     links: list[LinkCliente] = field(default_factory=list)
     meta_nofollow: bool = False
     autor: str = ""
+    autor_url: str = ""
     publicado_em: str = ""
     html: str = ""
 
@@ -200,9 +201,7 @@ def analisar_pagina(
     if robots and "nofollow" in (robots.get("content") or "").lower():
         a.meta_nofollow = True
 
-    autor = soup.find("meta", attrs={"name": re.compile("^author$", re.I)})
-    if autor:
-        a.autor = (autor.get("content") or "").strip()
+    a.autor, a.autor_url = extrair_autor(soup, a.url_final)
     pub = soup.find("meta", attrs={"property": "article:published_time"})
     if pub:
         a.publicado_em = (pub.get("content") or "")[:10]
@@ -244,50 +243,74 @@ def analisar_pagina(
 # 4. DR (Ahrefs)
 # ---------------------------------------------------------------------------
 
-def buscar_dr(dominios: list[str], api_key: str = "") -> dict[str, float | None]:
+def buscar_dr(dominios: list[str], api_key: str = "") -> tuple[dict, str]:
     """
-    Usa o endpoint público e gratuito da Ahrefs.
-    Com chave (a chave gratuita serve): POST em lote, até 1000 domínios por chamada.
-    Sem chave: GET um a um.
+    Endpoint gratuito da Ahrefs (não consome unidades), mas exige chave APIv3.
+    A chave pode ser de uma conta gratuita: Account settings > API keys.
+    Retorna ({dominio: dr}, mensagem_de_erro).
     """
     dominios = sorted(set(d for d in dominios if d))
     resultado: dict[str, float | None] = {d: None for d in dominios}
     if not dominios:
-        return resultado
+        return resultado, ""
+    if not api_key:
+        return resultado, ("Sem chave da Ahrefs. O endpoint de DR é gratuito, mas exige uma chave "
+                           "APIv3 (gere em Account settings > API keys).")
 
     base = "https://api.ahrefs.com/v3/public/domain-rating-free"
+    cab = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "User-Agent": UA}
+    erros: list[str] = []
 
-    if api_key:
-        for i in range(0, len(dominios), 1000):
-            lote = dominios[i:i + 1000]
-            try:
-                r = requests.post(
-                    base,
-                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-                    json={"targets": lote},
-                    timeout=60,
-                )
-                if r.status_code == 200:
-                    for item in _extrair_lista_dr(r.json()):
-                        alvo = normalizar_dominio(item.get("target", ""))
-                        if alvo in resultado:
-                            resultado[alvo] = item.get("domain_rating")
-                    continue
-            except requests.RequestException:
-                pass
-        # se o lote falhou ou veio incompleto, completa com GET
-    for d in [d for d, v in resultado.items() if v is None]:
+    # Tentativa em lote (até 1000 por chamada)
+    for i in range(0, len(dominios), 1000):
+        lote = dominios[i:i + 1000]
         try:
-            r = requests.get(base, params={"target": d, "output": "json"},
-                             headers={"Accept": "application/json"}, timeout=30)
+            r = requests.post(base, headers=cab, json={"targets": lote}, timeout=60)
             if r.status_code == 200:
-                dr = r.json().get("domain_rating", {})
-                resultado[d] = dr.get("domain_rating") if isinstance(dr, dict) else dr
-            elif r.status_code == 429:
-                time.sleep(2)
-        except requests.RequestException:
-            pass
-    return resultado
+                for item in _extrair_lista_dr(r.json()):
+                    alvo = normalizar_dominio(item.get("target", ""))
+                    if alvo in resultado:
+                        resultado[alvo] = _numero_dr(item.get("domain_rating"))
+            else:
+                erros.append(f"lote {r.status_code}: {r.text[:150]}")
+        except (requests.RequestException, ValueError) as e:
+            erros.append(f"lote: {e}")
+
+    # Completa um a um o que faltou
+    def um(d):
+        for tentativa in range(3):
+            try:
+                r = requests.get(base, params={"target": d, "output": "json"}, headers=cab, timeout=30)
+            except requests.RequestException as e:
+                return d, None, str(e)
+            if r.status_code == 200:
+                return d, _numero_dr(r.json().get("domain_rating")), ""
+            if r.status_code == 429:
+                time.sleep(2 * (tentativa + 1))
+                continue
+            return d, None, f"{r.status_code}: {r.text[:150]}"
+        return d, None, "429: limite de requisições"
+
+    faltando = [d for d, v in resultado.items() if v is None]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for d, dr, erro in ex.map(um, faltando):
+            resultado[d] = dr
+            if erro:
+                erros.append(f"{d} {erro}")
+
+    msg = ""
+    if all(v is None for v in resultado.values()) and erros:
+        msg = "A Ahrefs recusou as consultas de DR. Detalhe: " + erros[-1]
+    return resultado, msg
+
+
+def _numero_dr(v):
+    if isinstance(v, dict):
+        v = v.get("domain_rating")
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _extrair_lista_dr(js) -> list[dict]:
@@ -408,7 +431,177 @@ def buscar_contatos(dominio: str, artigos: list[tuple[str, str]] | None = None,
             visitadas += 1
             c.paginas_contato.add(final)
             c.mesclar_html(html, final)
-    return c.como_dict()
+    return c
+
+
+# ---------------------------------------------------------------------------
+# 6. Autor / jornalista
+# ---------------------------------------------------------------------------
+
+AUTOR_GENERICO = re.compile(
+    r"reda[cç][aã]o|equipe|admin|editorial|assessoria|staff|colaborador|"
+    r"conte[uú]do|marketing|^por$|an[oô]nimo|ag[eê]ncia|estad[aã]o conte|folhapress|reuters|"
+    r"\bafp\b|\bap\b|efe|press release|patrocinado|publieditorial|branded",
+    re.I,
+)
+
+
+def _limpar_nome(n: str) -> str:
+    n = re.sub(r"\s+", " ", n or "").strip(" |-–,")
+    n = re.sub(r"^(por|by|de|escrito por|texto)\s*:?\s+", "", n, flags=re.I)
+    n = re.split(r"\s[|•·]\s|\s-\s|,\s", n)[0].strip()
+    if len(n) > 60 or len(n) < 3 or "@" in n or "http" in n:
+        return ""
+    return n
+
+
+def extrair_autor(soup: BeautifulSoup, url_base: str) -> tuple[str, str]:
+    """Tenta achar nome e página do autor: JSON-LD, meta, rel=author, byline."""
+    import json
+    nome, url = "", ""
+
+    def do_ld(obj):
+        nonlocal nome, url
+        if isinstance(obj, list):
+            for o in obj:
+                do_ld(o)
+            return
+        if not isinstance(obj, dict):
+            return
+        if "@graph" in obj:
+            do_ld(obj["@graph"])
+        aut = obj.get("author") or obj.get("creator")
+        if aut and not nome:
+            if isinstance(aut, list):
+                aut = aut[0] if aut else None
+            if isinstance(aut, dict):
+                nome = _limpar_nome(str(aut.get("name", "")))
+                u = aut.get("url") or aut.get("@id") or ""
+                if isinstance(u, str) and u.startswith("http") and "#" not in u.split("/")[-1]:
+                    url = u
+            elif isinstance(aut, str):
+                nome = _limpar_nome(aut)
+
+    for sc in soup.find_all("script", type="application/ld+json"):
+        try:
+            do_ld(json.loads(sc.string or sc.get_text() or "{}"))
+        except (ValueError, TypeError):
+            continue
+        if nome:
+            break
+
+    if not nome:
+        for attrs in ({"name": "author"}, {"property": "article:author"}, {"name": "parsely-author"},
+                      {"name": "sailthru.author"}, {"name": "dc.creator"}):
+            m = soup.find("meta", attrs={k: re.compile(f"^{re.escape(v)}$", re.I) for k, v in attrs.items()})
+            if m and m.get("content"):
+                c = m["content"].strip()
+                if c.startswith("http"):
+                    url = url or c
+                else:
+                    nome = _limpar_nome(c)
+                if nome:
+                    break
+
+    link_autor = soup.find("a", rel=lambda r: r and "author" in r)
+    if link_autor is None:
+        link_autor = soup.find("a", href=re.compile(r"/(autor|author|autores|authors|colunista|colunistas|equipe|perfil)/", re.I))
+    if link_autor is not None:
+        if not url:
+            url = urljoin(url_base, link_autor.get("href", ""))
+        if not nome:
+            nome = _limpar_nome(link_autor.get_text(" ", strip=True))
+
+    if not nome:
+        el = soup.find(attrs={"itemprop": "author"}) or soup.find(
+            class_=re.compile(r"(^|[-_ ])(author|autor|byline)([-_ ]|name|$)", re.I))
+        if el is not None:
+            nome = _limpar_nome(el.get_text(" ", strip=True))
+
+    if url and not urlparse(url).netloc:
+        url = ""
+    return nome, url
+
+
+def autor_generico(nome: str) -> bool:
+    return not nome or bool(AUTOR_GENERICO.search(nome)) or len(nome.split()) < 2
+
+
+def perfis_autor_google(nome: str, serper_key: str, buscador, pais: str, idioma: str) -> dict:
+    """1 crédito do Serper por autor. Procura LinkedIn, X, Muck Rack e Instagram."""
+    q = (f'"{nome}" (site:linkedin.com/in OR site:x.com OR site:twitter.com '
+         f'OR site:muckrack.com OR site:instagram.com)')
+    try:
+        res = buscador(q, serper_key, pais, idioma, 1, "", "search")
+    except Exception:
+        return {}
+    sobrenome = sem_acento(nome.split()[-1])
+    achou: dict[str, str] = {}
+    for r in res:
+        link, titulo = r.get("url", ""), sem_acento(r.get("titulo", "") + " " + r.get("url", ""))
+        if sobrenome not in titulo:
+            continue
+        host = urlparse(link).netloc.lower()
+        if "linkedin.com" in host and "/in/" in link:
+            achou.setdefault("autor_linkedin", link)
+        elif host.endswith("x.com") or "twitter.com" in host:
+            if not re.search(r"/status/", link):
+                achou.setdefault("autor_x", link)
+        elif "muckrack.com" in host:
+            achou.setdefault("autor_muckrack", link)
+        elif "instagram.com" in host and "/p/" not in link:
+            achou.setdefault("autor_instagram", link)
+    return achou
+
+
+# ---------------------------------------------------------------------------
+# 7. Hunter.io (opcional, plano grátis com créditos mensais)
+# ---------------------------------------------------------------------------
+
+CARGOS_IMPRENSA = re.compile(
+    r"edit|jornal|journal|report|rep[oó]rter|reda|news|conte[uú]d|content|comunica|"
+    r"pauta|colun|marketing|publicidade|comercial|parcer|partner|seo|m[ií]dia|media",
+    re.I,
+)
+
+
+def hunter_email_autor(dominio: str, nome: str, key: str) -> tuple[dict, str]:
+    try:
+        r = requests.get("https://api.hunter.io/v2/email-finder",
+                         params={"domain": dominio, "full_name": nome, "api_key": key}, timeout=30)
+    except requests.RequestException as e:
+        return {}, str(e)
+    if r.status_code != 200:
+        return {}, f"Hunter {r.status_code}: {r.text[:150]}"
+    d = (r.json() or {}).get("data") or {}
+    if not d.get("email"):
+        return {}, ""
+    return {
+        "hunter_email_autor": d.get("email", ""),
+        "hunter_confianca": d.get("score"),
+        "hunter_cargo_autor": d.get("position") or "",
+        "autor_linkedin_hunter": d.get("linkedin_url") or d.get("linkedin") or "",
+    }, ""
+
+
+def hunter_emails_veiculo(dominio: str, key: str, limite: int = 10) -> tuple[str, str]:
+    try:
+        r = requests.get("https://api.hunter.io/v2/domain-search",
+                         params={"domain": dominio, "api_key": key, "limit": limite}, timeout=30)
+    except requests.RequestException as e:
+        return "", str(e)
+    if r.status_code != 200:
+        return "", f"Hunter {r.status_code}: {r.text[:150]}"
+    emails = ((r.json() or {}).get("data") or {}).get("emails") or []
+    itens = []
+    for e in emails:
+        nome = " ".join(x for x in (e.get("first_name"), e.get("last_name")) if x)
+        cargo = e.get("position") or e.get("department") or ""
+        desc = ", ".join(x for x in (nome, cargo) if x)
+        itens.append((0 if CARGOS_IMPRENSA.search(cargo or "") else 1,
+                      f"{e.get('value')}" + (f" ({desc})" if desc else "")))
+    itens.sort()
+    return " | ".join(i[1] for i in itens), ""
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +622,15 @@ def classificar(a: AnalisePagina) -> str:
     return "Menção sem link (oportunidade)"
 
 
+OPORTUNIDADES = {"Menção sem link (oportunidade)", "Com backlink nofollow/sponsored/ugc"}
+
+
 def executar(
     url_cliente: str,
     termos: list[str],
     serper_key: str,
     ahrefs_key: str = "",
+    hunter_key: str = "",
     pais: str = "br",
     idioma: str = "pt-br",
     paginas: int = 1,
@@ -442,13 +639,19 @@ def executar(
     excluir: list[str] | None = None,
     puxar_dr: bool = True,
     puxar_contatos: bool = True,
+    puxar_autor: bool = True,
+    perfis_google: bool = False,
+    hunter_autor: bool = False,
+    hunter_veiculo: bool = False,
+    so_oportunidades: bool = True,
     threads: int = 8,
     progresso=None,
     buscador=None,
-) -> list[dict]:
-    """Roda o fluxo completo e devolve uma linha por URL de menção."""
+) -> tuple[list[dict], list[str]]:
+    """Roda o fluxo completo. Devolve (linhas, avisos)."""
     log = progresso or (lambda etapa, frac: None)
     buscador = buscador or buscar_serper
+    avisos: list[str] = []
     dominio_cliente = normalizar_dominio(url_cliente)
     excluir = [normalizar_dominio(d) for d in (excluir or []) if d.strip()]
     termos = [t.strip() for t in termos if t.strip()]
@@ -472,10 +675,10 @@ def executar(
                 item["termos_busca"].add(termo)
                 item["fonte"].add("Notícias" if tipo == "news" else "Web")
             feitas += 1
-            log(f"Buscando menções ({feitas}/{total_buscas})", 0.25 * feitas / max(total_buscas, 1))
+            log(f"Buscando menções ({feitas}/{total_buscas})", 0.2 * feitas / max(total_buscas, 1))
 
     if not achados:
-        return []
+        return [], avisos
 
     # 2 e 3. Análise das páginas
     urls = list(achados)
@@ -484,18 +687,22 @@ def executar(
         futs = {ex.submit(analisar_pagina, u, dominio_cliente, termos): u for u in urls}
         for i, f in enumerate(as_completed(futs), 1):
             analises[futs[f]] = f.result()
-            log(f"Analisando páginas ({i}/{len(urls)})", 0.25 + 0.4 * i / len(urls))
+            log(f"Analisando páginas ({i}/{len(urls)})", 0.2 + 0.35 * i / len(urls))
 
+    status = {u: classificar(analises[u]) for u in urls}
     dominios = sorted({normalizar_dominio(u) for u in urls})
+    dominios_oport = {normalizar_dominio(u) for u in urls if status[u] in OPORTUNIDADES}
 
     # 4. DR
     drs: dict[str, float | None] = {}
     if puxar_dr:
-        log("Consultando DR na Ahrefs", 0.68)
-        drs = buscar_dr(dominios, ahrefs_key)
+        log("Consultando DR na Ahrefs", 0.57)
+        drs, erro_dr = buscar_dr(dominios, ahrefs_key)
+        if erro_dr:
+            avisos.append(erro_dr)
 
-    # 5. Contatos (um por domínio, reaproveitando o HTML do artigo)
-    contatos: dict[str, dict] = {}
+    # 5. Contatos do site (um por domínio, reaproveitando o HTML dos artigos)
+    contatos: dict[str, Contatos] = {}
     if puxar_contatos:
         por_dominio: dict[str, list] = {}
         for u in urls:
@@ -506,8 +713,83 @@ def executar(
                 try:
                     contatos[futs[f]] = f.result()
                 except Exception:
-                    contatos[futs[f]] = {}
-                log(f"Buscando contatos ({i}/{len(dominios)})", 0.7 + 0.3 * i / len(dominios))
+                    contatos[futs[f]] = Contatos()
+                log(f"Buscando contatos do site ({i}/{len(dominios)})", 0.6 + 0.2 * i / len(dominios))
+
+    # 6 e 7. Autor / jornalista (um por par domínio + autor)
+    dados_autor: dict[tuple, dict] = {}
+    if puxar_autor:
+        pares: dict[tuple, str] = {}
+        for u in urls:
+            a = analises[u]
+            if a.autor or a.autor_url:
+                chave = (normalizar_dominio(u), a.autor)
+                if a.autor_url and not pares.get(chave):
+                    pares[chave] = a.autor_url
+                else:
+                    pares.setdefault(chave, a.autor_url)
+
+        erros_hunter: list[str] = []
+
+        def enriquecer(par):
+            d, nome = par
+            info: dict = {}
+            url_autor = pares[par]
+            if url_autor and pertence_ao_dominio(urlparse(url_autor).netloc, d):
+                st, final, html = baixar(url_autor)
+                if html:
+                    ca = Contatos()
+                    ca.mesclar_html(html, final)
+                    site = contatos.get(d, Contatos())
+                    emails = ca.emails - site.emails
+                    redes = {k: v for k, v in ca.redes.items() if v not in site.redes.values()}
+                    if emails:
+                        info["autor_email"] = ", ".join(sorted(emails))
+                    if "LinkedIn" in redes:
+                        info["autor_linkedin"] = redes["LinkedIn"]
+                    if "X/Twitter" in redes:
+                        info["autor_x"] = redes["X/Twitter"]
+                    if "Instagram" in redes:
+                        info["autor_instagram"] = redes["Instagram"]
+            if autor_generico(nome):
+                return par, info
+            prioridade = (not so_oportunidades) or d in dominios_oport
+            if perfis_google and prioridade:
+                for k, v in perfis_autor_google(nome, serper_key, buscador, pais, idioma).items():
+                    info.setdefault(k, v)
+            if hunter_key and hunter_autor and prioridade:
+                h, erro = hunter_email_autor(d, nome, hunter_key)
+                if erro:
+                    erros_hunter.append(erro)
+                for k, v in h.items():
+                    if k == "autor_linkedin_hunter":
+                        if v:
+                            info.setdefault("autor_linkedin", v)
+                    else:
+                        info[k] = v
+            return par, info
+
+        if pares:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                for i, (par, info) in enumerate(ex.map(enriquecer, list(pares)), 1):
+                    dados_autor[par] = info
+                    log(f"Buscando dados dos autores ({i}/{len(pares)})", 0.8 + 0.12 * i / len(pares))
+        if erros_hunter:
+            avisos.append("Hunter (autor): " + erros_hunter[-1])
+
+    emails_veiculo: dict[str, str] = {}
+    if hunter_key and hunter_veiculo:
+        alvo = sorted(dominios_oport if so_oportunidades else dominios)
+        erros = []
+        for i, d in enumerate(alvo, 1):
+            emails_veiculo[d], erro = hunter_emails_veiculo(d, hunter_key)
+            if erro:
+                erros.append(erro)
+                if "429" in erro or "quota" in erro.lower() or "limit" in erro.lower():
+                    break
+            log(f"Hunter: emails dos veículos ({i}/{len(alvo)})", 0.92 + 0.08 * i / max(len(alvo), 1))
+        if erros:
+            avisos.append("Hunter (veículos): " + erros[-1])
 
     # Monta a tabela
     linhas = []
@@ -515,7 +797,7 @@ def executar(
         a, r = analises[u], achados[u]
         d = normalizar_dominio(u)
         linha = {
-            "status": classificar(a),
+            "status": status[u],
             "dominio": d,
             "dr": drs.get(d),
             "url": u,
@@ -526,6 +808,7 @@ def executar(
             "data_google": r.get("data", ""),
             "publicado_em": a.publicado_em,
             "autor": a.autor,
+            "autor_pagina": a.autor_url,
             "qtd_links_cliente": len(a.links),
             "links_dofollow": sum(1 for l in a.links if l.dofollow),
             "anchors": " | ".join(dict.fromkeys(l.anchor for l in a.links)),
@@ -534,7 +817,22 @@ def executar(
             "trecho_mencao": a.trecho or r.get("snippet", ""),
             "http": a.status_http,
         }
-        linha.update(contatos.get(d, {}))
+        if puxar_autor:
+            info = dados_autor.get((d, a.autor), {})
+            for k in ("autor_email", "hunter_email_autor", "hunter_confianca", "hunter_cargo_autor",
+                      "autor_linkedin", "autor_x", "autor_instagram", "autor_muckrack"):
+                linha[k] = info.get(k, "")
+            if a.autor and not autor_generico(a.autor):
+                from urllib.parse import quote_plus
+                linha["buscar_autor_muckrack"] = f"https://muckrack.com/search/results?q={quote_plus(a.autor)}"
+                linha["buscar_autor_linkedin"] = (
+                    "https://www.google.com/search?q=" + quote_plus(f'"{a.autor}" site:linkedin.com/in'))
+            else:
+                linha["buscar_autor_muckrack"] = linha["buscar_autor_linkedin"] = ""
+        if hunter_key and hunter_veiculo:
+            linha["emails_veiculo_hunter"] = emails_veiculo.get(d, "")
+        if d in contatos:
+            linha.update(contatos[d].como_dict())
         linhas.append(linha)
 
     ordem = {
@@ -545,4 +843,4 @@ def executar(
     }
     linhas.sort(key=lambda x: (ordem.get(x["status"], 3), -(x["dr"] or -1)))
     log("Concluído", 1.0)
-    return linhas
+    return linhas, avisos

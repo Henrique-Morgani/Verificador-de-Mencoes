@@ -6,7 +6,8 @@ Coloque o site do cliente e os termos (marca, produto, porta-voz...). O app busc
 - **Anchor, rel e URL linkada** de cada link para o cliente (considera subdomínios e meta robots nofollow)
 - **DR do domínio** pela Ahrefs
 - **Contatos**: emails (inclusive os protegidos pelo Cloudflare e os escritos como "nome [at] site.com"), telefones, WhatsApp, redes sociais, páginas de contato/anuncie/expediente e se o site tem formulário
-- Autor e data de publicação, quando a página informa
+- **Jornalista/autor da matéria**: nome e página de autor (lidos do próprio site), email e redes que aparecem na página do autor, LinkedIn/X/Muck Rack via Google (1 crédito Serper por autor), email do autor e emails da redação pelo Hunter.io (opcional), além de links prontos de busca no LinkedIn e no Muck Rack
+- Data de publicação, quando a página informa
 - Exportação em Excel (aba por URL + aba por domínio) e CSV
 
 ## Instalação (uma vez)
@@ -33,7 +34,8 @@ Abre no navegador em http://localhost:8501.
 | Serviço | Para quê | Custo |
 |---|---|---|
 | [Serper.dev](https://serper.dev) | Busca no Google (web e notícias) | 2.500 buscas grátis; depois cerca de US$ 1 por mil |
-| Ahrefs API v3 | DR | Endpoint gratuito da Ahrefs. Funciona sem chave (um domínio por vez); com chave (a gratuita, gerada em Account settings > API keys) consulta em lote |
+| Ahrefs API v3 | DR | Endpoint gratuito (não gasta unidades), mas exige chave. Uma conta gratuita serve: Account settings > API keys |
+| [Hunter.io](https://hunter.io) (opcional) | Email do autor e da redação | Plano grátis com créditos mensais; 1 crédito por autor ou por veículo |
 
 Cada página do Google por termo consome 1 crédito do Serper. Com Google Notícias ligado, dobra. O app mostra a estimativa antes de rodar.
 
