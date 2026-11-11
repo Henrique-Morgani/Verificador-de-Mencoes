@@ -1,0 +1,6 @@
+streamlit>=1.40
+requests
+beautifulsoup4
+pandas
+openpyxl
+python-dotenv
