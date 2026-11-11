@@ -253,16 +253,26 @@ def buscar_dr(dominios: list[str], api_key: str = "") -> tuple[dict, str]:
     resultado: dict[str, float | None] = {d: None for d in dominios}
     if not dominios:
         return resultado, ""
-    if not api_key:
-        return resultado, ("Sem chave da Ahrefs. O endpoint de DR é gratuito, mas exige uma chave "
-                           "APIv3 (gere em Account settings > API keys).")
-
     base = "https://api.ahrefs.com/v3/public/domain-rating-free"
-    cab = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "User-Agent": UA}
+    cab = {"Accept": "application/json", "User-Agent": UA}
     erros: list[str] = []
 
-    # Tentativa em lote (até 1000 por chamada)
-    for i in range(0, len(dominios), 1000):
+    if not api_key:
+        # Tenta sem chave (o anúncio da Ahrefs dizia que não precisava). Se recusar, avisa.
+        try:
+            r = requests.get(base, params={"target": dominios[0], "output": "json"}, headers=cab, timeout=30)
+            ok = r.status_code == 200
+        except requests.RequestException:
+            ok = False
+        if not ok:
+            return resultado, ("A Ahrefs não liberou o DR sem chave. O endpoint é gratuito, mas exige "
+                               "uma chave APIv3: crie uma conta gratuita na Ahrefs e gere em "
+                               "Account settings > API keys. Depois coloque em AHREFS_API_KEY nos Secrets.")
+    else:
+        cab["Authorization"] = f"Bearer {api_key}"
+
+    # Tentativa em lote (até 1000 por chamada; só com chave)
+    for i in range(0, len(dominios) if api_key else 0, 1000):
         lote = dominios[i:i + 1000]
         try:
             r = requests.post(base, headers=cab, json={"targets": lote}, timeout=60)
