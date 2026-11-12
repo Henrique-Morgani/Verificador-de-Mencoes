@@ -49,3 +49,40 @@ Para cada termo: `"termo" -site:cliente.com -site:dominio_excluido...`, no país
 - Links inseridos só via JavaScript não são vistos (o app lê o HTML da página).
 - Link via encurtador ou redirecionamento de afiliado não é reconhecido como link para o cliente.
 - O DR deve ser exibido com atribuição "Domain Rating by Ahrefs", conforme a licença do endpoint gratuito.
+
+## Clientes salvos, histórico e relatório quinzenal
+
+- **Clientes salvos**: escolha o cliente no topo. Cada busca nova soma ao histórico, sem apagar as menções anteriores. O app guarda quando cada menção apareceu, quando ganhou link e quando perdeu.
+- **Reverificar menções salvas**: em cada busca, abre de novo as páginas já guardadas para ver se ganharam ou perderam link (não gasta créditos).
+- **Alertas por email** (aba do cliente): cadastre um ou mais emails com frequência quinzenal, semanal ou mensal.
+
+### Peças necessárias
+
+| Peça | Para quê | Onde |
+|---|---|---|
+| Neon (Postgres grátis) | Guardar clientes, histórico e emails | neon.com |
+| Senha de app do Gmail | Enviar os relatórios | myaccount.google.com > Segurança > Senhas de app |
+| GitHub Actions | Rodar o robô toda segunda | Já vem no repositório (`.github/workflows/monitoramento.yml`) |
+
+### Secrets
+
+No Streamlit (Settings > Secrets):
+
+```toml
+SERPER_API_KEY = "..."
+AHREFS_API_KEY = "..."
+HUNTER_API_KEY = ""
+APP_SENHA = "..."
+DATABASE_URL = "postgresql://usuario:senha@host.neon.tech/neondb?sslmode=require"
+SMTP_USUARIO = "seuemail@gmail.com"
+SMTP_SENHA = "senha de app de 16 letras"
+APP_URL = "https://seuapp.streamlit.app"
+```
+
+No GitHub (Settings > Secrets and variables > Actions > New repository secret), crie um secret para cada um: `DATABASE_URL`, `SERPER_API_KEY`, `AHREFS_API_KEY`, `HUNTER_API_KEY`, `SMTP_USUARIO`, `SMTP_SENHA`, `APP_URL`.
+
+### Como o robô funciona
+
+Toda segunda às 8h17 (Brasília), o GitHub roda `agendado.py`. Para cada email com envio vencido, ele faz uma nova busca do cliente (período padrão: último mês), reverifica as menções salvas, guarda tudo e envia as novidades desde o último envio. Para testar na hora: aba **Actions > Monitoramento de menções > Run workflow**, marcando "Enviar para todos agora".
+
+Repositório público tem agendamentos desativados pelo GitHub após 60 dias sem atividade; o próprio workflow se reativa pela API a cada execução para evitar isso.

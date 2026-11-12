@@ -4,3 +4,5 @@ beautifulsoup4
 pandas
 openpyxl
 python-dotenv
+sqlalchemy>=2.0
+psycopg2-binary

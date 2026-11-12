@@ -654,11 +654,18 @@ def executar(
     hunter_autor: bool = False,
     hunter_veiculo: bool = False,
     so_oportunidades: bool = True,
+    urls_extras: list[str] | None = None,
+    urls_conhecidas: set[str] | None = None,
     threads: int = 8,
     progresso=None,
     buscador=None,
 ) -> tuple[list[dict], list[str]]:
-    """Roda o fluxo completo. Devolve (linhas, avisos)."""
+    """
+    Roda o fluxo completo. Devolve (linhas, avisos).
+    urls_extras: menções já conhecidas, verificadas de novo mesmo que o Google não as traga.
+    urls_conhecidas: URLs cujo autor já foi enriquecido antes (não gasta Serper/Hunter de novo).
+    """
+    urls_conhecidas = set(urls_conhecidas or [])
     log = progresso or (lambda etapa, frac: None)
     buscador = buscador or buscar_serper
     avisos: list[str] = []
@@ -686,6 +693,11 @@ def executar(
                 item["fonte"].add("Notícias" if tipo == "news" else "Web")
             feitas += 1
             log(f"Buscando menções ({feitas}/{total_buscas})", 0.2 * feitas / max(total_buscas, 1))
+
+    for u in urls_extras or []:
+        if u and u not in achados:
+            achados[u] = {"url": u, "titulo": "", "snippet": "", "data": "",
+                          "termos_busca": set(), "fonte": {"Reverificação"}}
 
     if not achados:
         return [], avisos
@@ -730,6 +742,11 @@ def executar(
     dados_autor: dict[tuple, dict] = {}
     if puxar_autor:
         pares: dict[tuple, str] = {}
+        pares_novos: set[tuple] = set()
+        for u in urls:
+            a = analises[u]
+            if (a.autor or a.autor_url) and u not in urls_conhecidas:
+                pares_novos.add((normalizar_dominio(u), a.autor))
         for u in urls:
             a = analises[u]
             if a.autor or a.autor_url:
@@ -763,7 +780,7 @@ def executar(
                         info["autor_instagram"] = redes["Instagram"]
             if autor_generico(nome):
                 return par, info
-            prioridade = (not so_oportunidades) or d in dominios_oport
+            prioridade = ((not so_oportunidades) or d in dominios_oport) and par in pares_novos
             if perfis_google and prioridade:
                 for k, v in perfis_autor_google(nome, serper_key, buscador, pais, idioma).items():
                     info.setdefault(k, v)
@@ -789,7 +806,8 @@ def executar(
 
     emails_veiculo: dict[str, str] = {}
     if hunter_key and hunter_veiculo:
-        alvo = sorted(dominios_oport if so_oportunidades else dominios)
+        dominios_novos = {normalizar_dominio(u) for u in urls if u not in urls_conhecidas}
+        alvo = sorted((dominios_oport if so_oportunidades else set(dominios)) & dominios_novos)
         erros = []
         for i, d in enumerate(alvo, 1):
             emails_veiculo[d], erro = hunter_emails_veiculo(d, hunter_key)
