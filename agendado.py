@@ -2,7 +2,7 @@
 Robô de monitoramento. Roda pelo GitHub Actions (ver .github/workflows/monitoramento.yml).
 
 Para cada cliente com email cadastrado e envio vencido:
-1. Faz uma nova busca de menções (período configurado, padrão último mês).
+1. Faz uma nova busca (web, notícias via RSS, comunidades e concorrentes; período padrão: último mês).
 2. Reverifica as menções já conhecidas (ganhou ou perdeu link?).
 3. Junta tudo ao histórico.
 4. Envia o relatório com as novidades desde o último envio.
@@ -17,38 +17,15 @@ import os
 import sys
 import traceback
 
-import core
+import fluxo
 import relatorio
 import storage
 
 
-def buscar_e_salvar(cliente: dict, periodo: str | None = None, log=print) -> tuple[dict, list[str]]:
-    cfg = cliente.get("config", {})
-    conhecidas = storage.urls_do_cliente(cliente["id"])
-    linhas, avisos = core.executar(
-        url_cliente=cliente["url"],
-        termos=cliente["termos"],
-        serper_key=os.getenv("SERPER_API_KEY", ""),
-        ahrefs_key=os.getenv("AHREFS_API_KEY", ""),
-        hunter_key=os.getenv("HUNTER_API_KEY", ""),
-        pais=cfg.get("pais", "br"),
-        idioma=cfg.get("idioma", "pt-br"),
-        paginas=cfg.get("paginas", 3),
-        periodo=periodo if periodo is not None else cfg.get("periodo_monitoramento", "m"),
-        incluir_noticias=cfg.get("incluir_noticias", True),
-        excluir=cfg.get("excluir", core.EXCLUIR_PADRAO),
-        puxar_dr=cfg.get("puxar_dr", True),
-        puxar_contatos=cfg.get("puxar_contatos", True),
-        puxar_autor=cfg.get("puxar_autor", True),
-        perfis_google=cfg.get("perfis_google", True),
-        hunter_autor=cfg.get("hunter_autor", False),
-        hunter_veiculo=cfg.get("hunter_veiculo", False),
-        so_oportunidades=cfg.get("so_oportunidades", True),
-        urls_extras=conhecidas,
-        urls_conhecidas=set(conhecidas),
-    )
-    resumo = storage.salvar_resultados(cliente["id"], linhas)
-    log(f"  {cliente['nome']}: {resumo}")
+def buscar_e_salvar(cliente: dict, log=print) -> tuple[dict, list[str]]:
+    resumo, avisos, stats = fluxo.rodar_cliente(cliente, origem="robô")
+    log(f"  {cliente['nome']}: {resumo} | créditos Serper: {stats.get('serper', 0)}, "
+        f"Hunter: {stats.get('hunter', 0)}, notícias RSS: {stats.get('noticias_rss', 0)}")
     for a in avisos:
         log(f"  aviso: {a}")
     return resumo, avisos

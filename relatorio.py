@@ -67,53 +67,94 @@ def _contato(m: dict) -> str:
     return "<br>".join(dict.fromkeys(partes))
 
 
+def _card(valor, rotulo, fundo, cor):
+    return (f'<td style="padding:12px 16px;background:{fundo};border-radius:8px;text-align:center">'
+            f'<div style="font-size:24px;font-weight:bold;color:{cor}">{valor}</div>'
+            f'<div style="font-size:12px;color:#555">{rotulo}</div></td><td style="width:10px"></td>')
+
+
+def _titulo_secao(texto, cor="#222"):
+    return f'<h3 style="color:{cor};margin:24px 0 4px">{texto}</h3>'
+
+
 def montar(cliente: dict, nov: dict, desde: datetime, ate: datetime) -> tuple[str, str]:
     nl, op, perd = nov["novos_links"], nov["novas_oportunidades"], nov["links_perdidos"]
+    neg, perg = nov.get("negativas", []), nov.get("perguntas", [])
+    outras, prosp, queb = nov.get("comunidade_outras", []), nov.get("prospects", []), nov.get("links_quebrados", [])
     periodo = f"{_d(desde)} a {_d(ate)}"
-    assunto = (f"[Menções] {cliente['nome']}: {len(nl)} novo(s) backlink(s), "
-               f"{len(op)} menção(ões) sem link ({periodo})")
+
+    partes_assunto = [f"{len(nl)} novo(s) backlink(s)", f"{len(op)} menção(ões) sem link"]
+    if perg:
+        partes_assunto.append(f"{len(perg)} pergunta(s) em comunidades")
+    assunto = f"[Menções] {cliente['nome']}: " + ", ".join(partes_assunto) + f" ({periodo})"
+    if neg:
+        assunto = f"⚠️ NEGATIVA | {len(neg)} menção(ões) negativa(s) em comunidades | " + assunto
 
     blocos = [f"""
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:860px;margin:auto;color:#222">
     <h2 style="margin-bottom:4px">Relatório de menções: {_e(cliente['nome'])}</h2>
     <p style="color:#666;margin-top:0">{_e(cliente['url'])} · período de {periodo}</p>
-    <table style="margin:16px 0 24px"><tr>
-      <td style="padding:12px 20px;background:#ecfdf3;border-radius:8px;text-align:center">
-        <div style="font-size:26px;font-weight:bold;color:#067647">{len(nl)}</div>
-        <div style="font-size:12px;color:#555">novos backlinks</div></td>
-      <td style="width:12px"></td>
-      <td style="padding:12px 20px;background:#fff7e6;border-radius:8px;text-align:center">
-        <div style="font-size:26px;font-weight:bold;color:#b54708">{len(op)}</div>
-        <div style="font-size:12px;color:#555">menções sem link</div></td>
-      <td style="width:12px"></td>
-      <td style="padding:12px 20px;background:#fef3f2;border-radius:8px;text-align:center">
-        <div style="font-size:26px;font-weight:bold;color:#b42318">{len(perd)}</div>
-        <div style="font-size:12px;color:#555">links perdidos</div></td>
-      <td style="width:12px"></td>
-      <td style="padding:12px 20px;background:#f2f4f7;border-radius:8px;text-align:center">
-        <div style="font-size:26px;font-weight:bold;color:#344054">{nov['total_links']}</div>
-        <div style="font-size:12px;color:#555">backlinks no total</div></td>
+    <table style="margin:16px 0 8px"><tr>
+      {_card(len(nl), "novos backlinks", "#ecfdf3", "#067647")}
+      {_card(len(op), "menções sem link", "#fff7e6", "#b54708")}
+      {_card(len(neg), "negativas em comunidades", "#fef3f2", "#b42318")}
+      {_card(len(perd) + len(queb), "links perdidos ou quebrados", "#fef3f2", "#b42318")}
+      {_card(nov['total_links'], "backlinks no total", "#f2f4f7", "#344054")}
     </tr></table>"""]
 
-    if nl:
-        blocos.append("<h3>Novos backlinks</h3>")
+    if neg:
+        blocos.append(_titulo_secao("⚠️ Menções negativas em comunidades", "#b42318"))
         blocos.append(_tabela(
-            ["Domínio", "DR", "Página", "Tipo", "Anchor"],
+            ["Onde", "Post", "Motivo", "Confiança"],
+            [[_e(m.get("dominio")), _link(m["url"], m.get("titulo") or None),
+              _e(m.get("motivo_sentimento", "")) + (" <b>(também é pergunta/pedido de indicação)</b>"
+                                                    if m.get("pergunta_indicacao") == "Sim" else ""),
+              _e(m.get("confianca_sentimento", ""))] for m in neg]))
+    if perg:
+        blocos.append(_titulo_secao("❓ Perguntas e pedidos de indicação", "#1a56db"))
+        blocos.append(_tabela(
+            ["Onde", "Post", "Sentimento", "Resumo"],
+            [[_e(m.get("dominio")), _link(m["url"], m.get("titulo") or None),
+              _e(m.get("sentimento", "")), _e(m.get("motivo_sentimento", ""))] for m in perg]))
+    if nl:
+        blocos.append(_titulo_secao("Novos backlinks"))
+        blocos.append(_tabela(
+            ["Domínio", "DR", "Página", "Tipo", "Qualidade", "Anchor"],
             [[_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
               "dofollow" if m["status"] == "Com backlink dofollow" else "nofollow/sponsored/ugc",
-              _e(m.get("anchors", ""))] for m in nl]))
+              _e(m.get("qualidade_link", "")), _e(m.get("anchors", ""))] for m in nl]))
     if op:
-        blocos.append("<h3>Menções sem link (oportunidades de link reclamation)</h3>")
+        blocos.append(_titulo_secao("Menções sem link (oportunidades de link reclamation)"))
         blocos.append(_tabela(
             ["Domínio", "DR", "Página", "Autor", "Contato"],
             [[_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
               _e(m.get("autor", "")), _contato(m)] for m in op]))
+    if queb:
+        blocos.append(_titulo_secao("Links para páginas quebradas do cliente", "#b54708"))
+        blocos.append(_tabela(
+            ["Domínio", "DR", "Página que linka", "Destino do link", "Contato"],
+            [[_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
+              _e(m.get("destino_link", "")) + "<br>" + _e(m.get("urls_linkadas", "")), _contato(m)]
+             for m in queb]))
     if perd:
-        blocos.append("<h3>Links perdidos</h3>")
+        blocos.append(_titulo_secao("Links perdidos"))
         blocos.append(_tabela(
             ["Domínio", "DR", "Página", "Status atual"],
             [[_e(m.get("dominio")), _dr(m), _link(m["url"]), _e(m["status"])] for m in perd]))
-    if not (nl or op or perd):
+    if prosp:
+        blocos.append(_titulo_secao("Prospects: sites que citam concorrentes e não citam o cliente"))
+        blocos.append(_tabela(
+            ["Domínio", "DR", "Página", "Concorrentes citados", "Contato"],
+            [[_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
+              _e(m.get("concorrentes_citados", "")), _contato(m)] for m in prosp[:30]]))
+    if outras:
+        blocos.append(_titulo_secao("Outras menções em comunidades"))
+        blocos.append(_tabela(
+            ["Onde", "Post", "Sentimento", "Resumo"],
+            [[_e(m.get("dominio")), _link(m["url"], m.get("titulo") or None),
+              _e(m.get("sentimento", "") or "não classificada"), _e(m.get("motivo_sentimento", ""))]
+             for m in outras]))
+    if not (nl or op or perd or neg or perg or outras or prosp or queb):
         blocos.append('<p style="padding:16px;background:#f9fafb;border-radius:8px">'
                       "Nenhuma novidade neste período. O monitoramento continua ativo.</p>")
 

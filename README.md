@@ -86,3 +86,21 @@ No GitHub (Settings > Secrets and variables > Actions > New repository secret), 
 Toda segunda às 8h17 (Brasília), o GitHub roda `agendado.py`. Para cada email com envio vencido, ele faz uma nova busca do cliente (período padrão: último mês), reverifica as menções salvas, guarda tudo e envia as novidades desde o último envio. Para testar na hora: aba **Actions > Monitoramento de menções > Run workflow**, marcando "Enviar para todos agora".
 
 Repositório público tem agendamentos desativados pelo GitHub após 60 dias sem atividade; o próprio workflow se reativa pela API a cada execução para evitar isso.
+
+## Novidades da versão 3
+
+- **Busca econômica**: todos os termos vão numa busca só (`"a" OR "b"`); comunidades numa busca só; o robô usa menos páginas. A barra lateral mostra os créditos gastos no mês, e cada busca registra quanto gastou.
+- **Notícias grátis** pelo RSS do Google Notícias (os links são convertidos para a URL real da matéria; quando não dá, a notícia aparece com o link do Google e status "Notícia (URL não resolvida)").
+- **Comunidades** (Reddit, Quora, Reclame Aqui, YouTube, LinkedIn, TikTok, X, Facebook): status "Menção em comunidade", com sentimento (positiva, negativa, neutra, mista), marcação de pergunta ou pedido de indicação e motivo, classificados pelo Gemini. Cada menção é classificada uma vez só.
+- **Concorrentes**: sites que citam o concorrente e não citam o cliente viram "Prospect: cita concorrente".
+- **Qualidade do link**: noindex, canonical para outra URL, posição do link (conteúdo, rodapé, barra lateral, menu, comentário) e resumo "Editorial" ou "Baixa: motivos".
+- **Link para página quebrada**: se o link aponta para uma página do cliente que responde 404 ou erro.
+- **Ignorar** URLs ou domínios inteiros (aba Ignorados para restaurar).
+- **Outreach**: selecione linhas e marque Contatado, Respondeu, Recusou ou Link conquistado. Quando uma menção contatada ganha link, o status muda sozinho para Link conquistado. O topo mostra a taxa de conversão.
+- **Evolução**: gráficos mensais de backlinks ativos, menções novas, links ganhos e perdidos.
+- **Coluna Novidade** compara sempre com a última busca salva do cliente (manual ou do robô).
+- **Email**: menções negativas em comunidades abrem o relatório e o assunto começa com "⚠️ NEGATIVA". Também traz perguntas, links quebrados e prospects.
+
+### Novo segredo
+
+`GEMINI_API_KEY`: chave grátis do Google AI Studio (aistudio.google.com > Get API key). Opcional: `GEMINI_MODELO` (padrão `gemini-flash-lite-latest`). Coloque nos Secrets do Streamlit e nos secrets do GitHub.

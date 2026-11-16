@@ -6,3 +6,5 @@ openpyxl
 python-dotenv
 sqlalchemy>=2.0
 psycopg2-binary
+googlenewsdecoder>=0.2
+httpx[http2]

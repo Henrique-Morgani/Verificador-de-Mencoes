@@ -11,12 +11,15 @@ Fluxo:
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,6 +37,28 @@ EXCLUIR_PADRAO = [
     "youtube.com", "tiktok.com", "pinterest.com", "google.com", "wikipedia.org",
     "reclameaqui.com.br", "glassdoor.com.br", "glassdoor.com", "indeed.com",
 ]
+
+# Comunidades que podem ser monitoradas (busca única com site: OR site:)
+COMUNIDADES_DISPONIVEIS = {
+    "Reddit": "reddit.com",
+    "Quora": "quora.com",
+    "Reclame Aqui": "reclameaqui.com.br",
+    "YouTube": "youtube.com",
+    "LinkedIn (posts)": "linkedin.com",
+    "TikTok": "tiktok.com",
+    "X/Twitter": "x.com",
+    "Facebook (páginas públicas)": "facebook.com",
+}
+COMUNIDADES_PADRAO = ["reddit.com", "quora.com", "reclameaqui.com.br"]
+
+ST_DOFOLLOW = "Com backlink dofollow"
+ST_NOFOLLOW = "Com backlink nofollow/sponsored/ugc"
+ST_QUEBRADO = "Link para página quebrada"
+ST_SEM_LINK = "Menção sem link (oportunidade)"
+ST_COMUNIDADE = "Menção em comunidade"
+ST_PROSPECT = "Prospect: cita concorrente"
+ST_NAO_ENCONTRADO = "Termo não encontrado na página"
+ST_NOTICIA_NR = "Notícia (URL não resolvida)"
 
 REDES = {
     "Instagram": "instagram.com",
@@ -85,20 +110,27 @@ def sem_acento(txt: str) -> str:
     ).lower()
 
 
-def baixar(url: str, sessao: requests.Session | None = None) -> tuple[int, str, str]:
-    """Retorna (status, url_final, html). Status 0 = erro de conexão."""
+def baixar_completo(url: str, sessao: requests.Session | None = None) -> tuple[int, str, str, dict]:
+    """Retorna (status, url_final, html, cabeçalhos). Status 0 = erro de conexão."""
     s = sessao or requests
     try:
         r = s.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        ctype = r.headers.get("content-type", "")
+        cab = {k.lower(): v for k, v in r.headers.items()}
+        ctype = cab.get("content-type", "")
         if "html" not in ctype and "xml" not in ctype and ctype:
-            return r.status_code, r.url, ""
+            return r.status_code, r.url, "", cab
         if "charset" not in ctype.lower():
             m = re.search(rb'<meta[^>]+charset=["\']?([\w-]+)', r.content[:3000], re.I)
             r.encoding = m.group(1).decode() if m else (r.apparent_encoding or "utf-8")
-        return r.status_code, r.url, r.text
+        return r.status_code, r.url, r.text, cab
     except requests.RequestException:
-        return 0, url, ""
+        return 0, url, "", {}
+
+
+def baixar(url: str, sessao: requests.Session | None = None) -> tuple[int, str, str]:
+    """Retorna (status, url_final, html). Status 0 = erro de conexão."""
+    st, final, html, _ = baixar_completo(url, sessao)
+    return st, final, html
 
 
 def decodificar_cfemail(hexstr: str) -> str:
@@ -116,10 +148,117 @@ def decodificar_cfemail(hexstr: str) -> str:
 # 1. Busca de menções (Serper.dev)
 # ---------------------------------------------------------------------------
 
-def montar_query(termo: str, dominio_cliente: str, excluir: list[str]) -> str:
-    partes = [f'"{termo}"', f"-site:{dominio_cliente}"]
-    partes += [f"-site:{d}" for d in excluir if d]
-    return " ".join(partes)
+LIMITE_PALAVRAS_GOOGLE = 30  # o Google ignora o que passa de 32 palavras
+
+
+def grupo_or(termos: list[str]) -> str:
+    termos = [t.strip().replace('"', "") for t in termos if t.strip()]
+    if len(termos) == 1:
+        return f'"{termos[0]}"'
+    return "(" + " OR ".join(f'"{t}"' for t in termos) + ")"
+
+
+def _palavras(q: str) -> int:
+    return len(q.replace("(", " ").replace(")", " ").replace('"', " ").split())
+
+
+def montar_query(termos, dominio_cliente: str, excluir: list[str], extra: str = "") -> str:
+    """Todos os termos numa busca só (OR), excluindo o cliente e, se couber, outros domínios."""
+    if isinstance(termos, str):
+        termos = [termos]
+    q = grupo_or(termos) + (f" {extra}" if extra else "")
+    if dominio_cliente:
+        q += f" -site:{dominio_cliente}"
+    for d in excluir or []:
+        if d and _palavras(q) + 1 <= LIMITE_PALAVRAS_GOOGLE:
+            q += f" -site:{d}"
+    return q
+
+
+def query_comunidades(termos: list[str], comunidades: list[str]) -> str:
+    sites = " OR ".join(f"site:{c}" for c in comunidades)
+    return f"{grupo_or(termos)} ({sites})" if len(comunidades) > 1 else f"{grupo_or(termos)} site:{comunidades[0]}"
+
+
+# ---------------------------------------------------------------------------
+# Notícias pelo RSS do Google Notícias (grátis)
+# ---------------------------------------------------------------------------
+
+EDICOES_NEWS = {
+    "br": ("pt-BR", "BR", "BR:pt-419"), "pt": ("pt-PT", "PT", "PT:pt-150"),
+    "mx": ("es-419", "MX", "MX:es-419"), "co": ("es-419", "CO", "CO:es-419"),
+    "ar": ("es-419", "AR", "AR:es-419"), "us": ("en-US", "US", "US:en"),
+    "es": ("es", "ES", "ES:es"),
+}
+QUANDO_NEWS = {"d": "1d", "w": "7d", "m": "30d", "y": "365d"}
+
+
+def decodificar_links_news(links: list[str]) -> dict[str, str]:
+    """Converte links news.google.com/rss/articles/... na URL real da matéria."""
+    if not links:
+        return {}
+    try:
+        from googlenewsdecoder import GoogleDecoder
+    except ImportError:
+        return {}
+    saida: dict[str, str] = {}
+    try:
+        with GoogleDecoder(timeout=15, user_agent=UA) as dec:
+            for i in range(0, len(links), 20):
+                lote = links[i:i + 20]
+                for link, res in zip(lote, dec.decode_google_news_urls(lote, interval=None)):
+                    if res.get("success") and res.get("decoded_url"):
+                        saida[link] = res["decoded_url"]
+    except Exception:
+        pass
+    return saida
+
+
+def buscar_noticias_rss(termos: list[str], dominio_cliente: str, pais: str = "br",
+                        periodo: str = "", limite: int = 60) -> tuple[list[dict], str]:
+    """Busca notícias no RSS público do Google Notícias. Retorna (itens, aviso)."""
+    hl, gl, ceid = EDICOES_NEWS.get(pais, EDICOES_NEWS["br"])
+    q = grupo_or(termos)
+    if dominio_cliente:
+        q += f" -site:{dominio_cliente}"
+    if periodo in QUANDO_NEWS:
+        q += f" when:{QUANDO_NEWS[periodo]}"
+    url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl={hl}&gl={gl}&ceid={ceid}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            return [], f"Google Notícias (RSS) respondeu {r.status_code}."
+        raiz = ET.fromstring(r.content)
+    except (requests.RequestException, ET.ParseError) as e:
+        return [], f"Não consegui ler o RSS do Google Notícias: {e}"
+
+    itens = []
+    for it in raiz.iter("item"):
+        fonte = it.find("source")
+        titulo = (it.findtext("title") or "").strip()
+        nome_fonte = (fonte.text or "").strip() if fonte is not None else ""
+        if nome_fonte and titulo.endswith(" - " + nome_fonte):
+            titulo = titulo[: -len(" - " + nome_fonte)]
+        itens.append({
+            "link_google": (it.findtext("link") or "").strip(),
+            "titulo": titulo,
+            "data": (it.findtext("pubDate") or "")[:16],
+            "dominio_fonte": normalizar_dominio(fonte.get("url", "")) if fonte is not None else "",
+        })
+        if len(itens) >= limite:
+            break
+
+    decod = decodificar_links_news([i["link_google"] for i in itens])
+    saida, nao_resolvidos = [], 0
+    for i in itens:
+        real = decod.get(i["link_google"])
+        if not real:
+            nao_resolvidos += 1
+        saida.append({"url": real or i["link_google"], "titulo": i["titulo"], "snippet": "",
+                      "data": i["data"], "dominio_fonte": i["dominio_fonte"], "resolvido": bool(real)})
+    aviso = (f"{nao_resolvidos} notícia(s) do Google Notícias ficaram sem a URL real; "
+             "elas aparecem com o link do Google e sem checagem de backlink.") if nao_resolvidos else ""
+    return saida, aviso
 
 
 def buscar_serper(
@@ -171,6 +310,35 @@ class LinkCliente:
     anchor: str
     rel: str
     dofollow: bool
+    posicao: str = ""
+
+
+POSICOES = [
+    ("rodapé", re.compile(r"foot|rodape|rodapé", re.I), {"footer"}),
+    ("comentário", re.compile(r"comment|coment[aá]rio|disqus|respond", re.I), set()),
+    ("barra lateral", re.compile(r"sidebar|side-bar|widget|aside|lateral", re.I), {"aside"}),
+    ("menu/cabeçalho", re.compile(r"^(nav|menu|header|topbar|navbar)|[-_ ](nav|menu|header)([-_ ]|$)", re.I), {"nav", "header"}),
+    ("conteúdo", re.compile(r"(^|[-_ ])(content|conteudo|post|entry|article|materia|texto|story|body-text)([-_ ]|$)", re.I), {"article", "main"}),
+]
+
+
+def posicao_link(tag) -> str:
+    """Onde o link está na página, olhando do elemento mais próximo para fora."""
+    for anc in tag.parents:
+        if anc is None or getattr(anc, "name", None) in (None, "[document]", "html", "body"):
+            break
+        rotulo = " ".join(anc.get("class") or []) + " " + (anc.get("id") or "")
+        for nome, regex, tags in POSICOES:
+            if anc.name in tags or (rotulo.strip() and regex.search(rotulo)):
+                return nome
+    return "corpo da página"
+
+
+def _url_norm(u: str) -> str:
+    p = urlparse(u)
+    host = p.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    return host + p.path.rstrip("/")
 
 
 @dataclass
@@ -181,6 +349,9 @@ class AnalisePagina:
     trecho: str = ""
     links: list[LinkCliente] = field(default_factory=list)
     meta_nofollow: bool = False
+    noindex: bool = False
+    canonical_outra: str = ""
+    concorrentes_citados: list[str] = field(default_factory=list)
     autor: str = ""
     autor_url: str = ""
     publicado_em: str = ""
@@ -188,18 +359,28 @@ class AnalisePagina:
 
 
 def analisar_pagina(
-    url: str, dominio_cliente: str, termos: list[str], sessao=None
+    url: str, dominio_cliente: str, termos: list[str], sessao=None,
+    termos_concorrentes: list[str] | None = None,
 ) -> AnalisePagina:
     a = AnalisePagina()
-    a.status_http, a.url_final, a.html = baixar(url, sessao)
+    a.status_http, a.url_final, a.html, cab = baixar_completo(url, sessao)
     if not a.html:
         return a
 
     soup = BeautifulSoup(a.html, "html.parser")
 
-    robots = soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
-    if robots and "nofollow" in (robots.get("content") or "").lower():
+    xrobots = cab.get("x-robots-tag", "").lower()
+    conteudo_robots = " ".join((m.get("content") or "").lower() for m in soup.find_all(
+        "meta", attrs={"name": re.compile("^(robots|googlebot)$", re.I)}))
+    if "nofollow" in conteudo_robots or "nofollow" in xrobots:
         a.meta_nofollow = True
+    if "noindex" in conteudo_robots or "noindex" in xrobots:
+        a.noindex = True
+    can = soup.find("link", rel=lambda r: bool(r) and str(r).lower() == "canonical")
+    if can and can.get("href"):
+        href_can = urljoin(a.url_final, can["href"].strip())
+        if _url_norm(href_can) != _url_norm(a.url_final):
+            a.canonical_outra = href_can
 
     a.autor, a.autor_url = extrair_autor(soup, a.url_final)
     pub = soup.find("meta", attrs={"property": "article:published_time"})
@@ -220,6 +401,7 @@ def analisar_pagina(
                 anchor=tag.get_text(" ", strip=True)[:120] or "(imagem/sem texto)",
                 rel=rel or "(nenhum)",
                 dofollow=dofollow,
+                posicao=posicao_link(tag),
             ))
 
     # Texto visível para confirmar menção
@@ -236,7 +418,51 @@ def analisar_pagina(
             if not a.trecho:
                 ini, fim = max(0, pos - 120), min(len(texto), pos + len(termo) + 120)
                 a.trecho = ("…" if ini else "") + texto[ini:fim] + ("…" if fim < len(texto) else "")
+    for termo in termos_concorrentes or []:
+        tn = sem_acento(termo)
+        pos = texto_norm.find(tn)
+        if pos >= 0:
+            a.concorrentes_citados.append(termo)
+            if not a.termos_encontrados and not a.trecho:
+                ini, fim = max(0, pos - 120), min(len(texto), pos + len(termo) + 120)
+                a.trecho = ("…" if ini else "") + texto[ini:fim] + ("…" if fim < len(texto) else "")
     return a
+
+
+def verificar_destinos(hrefs: list[str], threads: int = 8) -> dict[str, tuple[int, str]]:
+    """Status HTTP de cada URL do cliente que recebeu link: {href: (status, url_final)}."""
+    def um(h):
+        alvo = h.split("#")[0]
+        try:
+            r = requests.head(alvo, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+            if r.status_code in (403, 405, 501) or r.status_code >= 500:
+                r = requests.get(alvo, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True, stream=True)
+                r.close()
+            return h, (r.status_code, r.url)
+        except requests.RequestException:
+            return h, (0, alvo)
+    hrefs = list(dict.fromkeys(hrefs))
+    if not hrefs:
+        return {}
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        return dict(ex.map(um, hrefs))
+
+
+def qualidade_link(a: AnalisePagina) -> str:
+    """Resumo da qualidade do(s) link(s) para o cliente nesta página."""
+    if not a.links:
+        return ""
+    motivos = []
+    if a.noindex:
+        motivos.append("página noindex")
+    if a.canonical_outra:
+        motivos.append("canonical aponta para outra URL")
+    if not any(l.dofollow for l in a.links):
+        motivos.append("sem link dofollow")
+    if not any(l.posicao in ("conteúdo", "corpo da página") for l in a.links):
+        locais = sorted({l.posicao for l in a.links})
+        motivos.append("link só em " + "/".join(locais))
+    return "Editorial" if not motivos else "Baixa: " + "; ".join(motivos)
 
 
 # ---------------------------------------------------------------------------
@@ -618,21 +844,27 @@ def hunter_emails_veiculo(dominio: str, key: str, limite: int = 10) -> tuple[str
 # Orquestração
 # ---------------------------------------------------------------------------
 
-def classificar(a: AnalisePagina) -> str:
+def classificar(a: AnalisePagina, destinos: dict | None = None) -> str:
     if a.status_http == 0:
         return "Erro ao acessar"
     if not a.html:
         return f"Página bloqueada/indisponível ({a.status_http})"
     if not a.termos_encontrados:
-        return "Termo não encontrado na página"
+        return ST_PROSPECT if a.concorrentes_citados else ST_NAO_ENCONTRADO
+    if a.links and destinos:
+        quebrados = [l for l in a.links if 400 <= destinos.get(l.href, (200, ""))[0] < 600]
+        if quebrados:
+            return ST_QUEBRADO
     if any(l.dofollow for l in a.links):
-        return "Com backlink dofollow"
+        return ST_DOFOLLOW
     if a.links:
-        return "Com backlink nofollow/sponsored/ugc"
-    return "Menção sem link (oportunidade)"
+        return ST_NOFOLLOW
+    return ST_SEM_LINK
 
 
-OPORTUNIDADES = {"Menção sem link (oportunidade)", "Com backlink nofollow/sponsored/ugc"}
+OPORTUNIDADES = {ST_SEM_LINK, ST_NOFOLLOW, ST_QUEBRADO, ST_PROSPECT}
+ORDEM_STATUS = {ST_SEM_LINK: 0, ST_QUEBRADO: 1, ST_PROSPECT: 2, ST_COMUNIDADE: 3, ST_NOFOLLOW: 4,
+                ST_DOFOLLOW: 5, ST_NOTICIA_NR: 6, ST_NAO_ENCONTRADO: 9}
 
 
 def executar(
@@ -654,66 +886,162 @@ def executar(
     hunter_autor: bool = False,
     hunter_veiculo: bool = False,
     so_oportunidades: bool = True,
+    comunidades: list[str] | None = None,
+    concorrentes: list[str] | None = None,
+    dominios_concorrentes: list[str] | None = None,
+    paginas_concorrentes: int = 1,
+    ignorar_urls: set[str] | None = None,
+    ignorar_dominios: set[str] | None = None,
     urls_extras: list[str] | None = None,
     urls_conhecidas: set[str] | None = None,
+    estatisticas: dict | None = None,
     threads: int = 8,
     progresso=None,
     buscador=None,
+    buscador_noticias=None,
 ) -> tuple[list[dict], list[str]]:
     """
     Roda o fluxo completo. Devolve (linhas, avisos).
-    urls_extras: menções já conhecidas, verificadas de novo mesmo que o Google não as traga.
-    urls_conhecidas: URLs cujo autor já foi enriquecido antes (não gasta Serper/Hunter de novo).
+    - Web: uma busca só com todos os termos (OR).
+    - Notícias: RSS do Google Notícias (grátis).
+    - Comunidades: uma busca só com site: OR site: (sem checar backlink).
+    - Concorrentes: uma busca com os concorrentes; páginas que não citam o cliente viram prospects.
+    urls_extras: menções já conhecidas, verificadas de novo.
+    urls_conhecidas: URLs já enriquecidas antes (não gasta Serper/Hunter de novo).
+    estatisticas: dicionário que recebe os créditos gastos.
     """
     urls_conhecidas = set(urls_conhecidas or [])
+    ignorar_urls = set(ignorar_urls or [])
+    ignorar_dominios = {normalizar_dominio(d) for d in (ignorar_dominios or [])}
+    stats = estatisticas if estatisticas is not None else {}
+    for k in ("serper", "hunter", "noticias_rss"):
+        stats.setdefault(k, 0)
     log = progresso or (lambda etapa, frac: None)
-    buscador = buscador or buscar_serper
+    _buscador = buscador or buscar_serper
+    _noticias = buscador_noticias or buscar_noticias_rss
     avisos: list[str] = []
     dominio_cliente = normalizar_dominio(url_cliente)
     excluir = [normalizar_dominio(d) for d in (excluir or []) if d.strip()]
     termos = [t.strip() for t in termos if t.strip()]
+    comunidades = [normalizar_dominio(c) for c in (comunidades or []) if c.strip()]
+    concorrentes = [c.strip() for c in (concorrentes or []) if c.strip()]
+    dominios_concorrentes = [normalizar_dominio(d) for d in (dominios_concorrentes or []) if d.strip()]
 
-    # 1. Busca
+    def buscar(q, pags=1, per=periodo, tipo="search"):
+        res = _buscador(q, serper_key, pais, idioma, pags, per, tipo)
+        stats["serper"] += max(1, min(pags, len(res) // 10 + 1))
+        return res
+
+    def eh_comunidade(host: str) -> bool:
+        return any(pertence_ao_dominio(host, c) for c in comunidades)
+
+    def ignorado(url: str, host: str) -> bool:
+        return url in ignorar_urls or any(pertence_ao_dominio(host, d) for d in ignorar_dominios)
+
     achados: dict[str, dict] = {}
-    tipos = ["search"] + (["news"] if incluir_noticias else [])
-    total_buscas = len(termos) * len(tipos)
-    feitas = 0
-    for termo in termos:
-        q = montar_query(termo, dominio_cliente, excluir)
-        for tipo in tipos:
-            for r in buscador(q, serper_key, pais, idioma, paginas, periodo, tipo):
-                url = r["url"]
-                host = urlparse(url).netloc
-                if not url or pertence_ao_dominio(host, dominio_cliente):
-                    continue
-                if any(pertence_ao_dominio(host, d) for d in excluir):
-                    continue
-                item = achados.setdefault(url, {**r, "termos_busca": set(), "fonte": set()})
-                item["termos_busca"].add(termo)
-                item["fonte"].add("Notícias" if tipo == "news" else "Web")
-            feitas += 1
-            log(f"Buscando menções ({feitas}/{total_buscas})", 0.2 * feitas / max(total_buscas, 1))
+
+    def registrar(r: dict, fonte: str, termos_r: list[str], filtrar_excluidos: bool = True):
+        url = r.get("url", "")
+        host = urlparse(url).netloc
+        if not url or pertence_ao_dominio(host, dominio_cliente) or ignorado(url, host):
+            return
+        if filtrar_excluidos and any(pertence_ao_dominio(host, d) for d in excluir):
+            return
+        if fonte != "Comunidade" and eh_comunidade(host):
+            fonte = "Comunidade"
+        item = achados.setdefault(url, {**r, "termos_busca": set(), "fonte": set()})
+        item["termos_busca"].update(termos_r)
+        item["fonte"].add(fonte)
+        for k in ("titulo", "snippet", "data"):
+            if not item.get(k) and r.get(k):
+                item[k] = r[k]
+
+    # 1a. Web (uma busca para todos os termos)
+    if termos:
+        log("Buscando menções na web", 0.03)
+        for r in buscar(montar_query(termos, dominio_cliente, excluir), paginas):
+            registrar(r, "Web", termos)
+
+    # 1b. Notícias (RSS grátis)
+    if termos and incluir_noticias:
+        log("Buscando no Google Notícias", 0.08)
+        itens, aviso = _noticias(termos, dominio_cliente, pais, periodo)
+        stats["noticias_rss"] += len(itens)
+        if aviso:
+            avisos.append(aviso)
+        for r in itens:
+            if r.get("dominio_fonte") and (pertence_ao_dominio(r["dominio_fonte"], dominio_cliente)
+                                           or ignorado(r["url"], r["dominio_fonte"])):
+                continue
+            registrar(r, "Notícias", termos)
+            if not r.get("resolvido", True) and r["url"] in achados:
+                achados[r["url"]]["nao_resolvido"] = True
+                achados[r["url"]]["dominio_fonte"] = r.get("dominio_fonte", "")
+
+    # 1c. Comunidades (uma busca para todas)
+    if termos and comunidades:
+        log("Buscando em comunidades", 0.12)
+        for r in buscar(query_comunidades(termos, comunidades), 1):
+            if eh_comunidade(urlparse(r.get("url", "")).netloc):
+                registrar(r, "Comunidade", termos, filtrar_excluidos=False)
+
+    # 1d. Concorrentes (prospects)
+    if concorrentes:
+        log("Buscando menções a concorrentes", 0.16)
+        excl_conc = [dominio_cliente] + dominios_concorrentes + excluir
+        for r in buscar(montar_query(concorrentes, "", excl_conc), paginas_concorrentes):
+            host = urlparse(r.get("url", "")).netloc
+            if any(pertence_ao_dominio(host, d) for d in dominios_concorrentes):
+                continue
+            registrar(r, "Concorrente", [])
 
     for u in urls_extras or []:
-        if u and u not in achados:
+        if u and u not in achados and not ignorado(u, urlparse(u).netloc):
             achados[u] = {"url": u, "titulo": "", "snippet": "", "data": "",
                           "termos_busca": set(), "fonte": {"Reverificação"}}
 
     if not achados:
+        log("Concluído", 1.0)
         return [], avisos
 
     # 2 e 3. Análise das páginas
     urls = list(achados)
     analises: dict[str, AnalisePagina] = {}
+
+    def analisar(u):
+        if achados[u].get("nao_resolvido"):
+            return AnalisePagina()
+        return analisar_pagina(u, dominio_cliente, termos, termos_concorrentes=concorrentes)
+
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futs = {ex.submit(analisar_pagina, u, dominio_cliente, termos): u for u in urls}
+        futs = {ex.submit(analisar, u): u for u in urls}
         for i, f in enumerate(as_completed(futs), 1):
             analises[futs[f]] = f.result()
-            log(f"Analisando páginas ({i}/{len(urls)})", 0.2 + 0.35 * i / len(urls))
+            log(f"Analisando páginas ({i}/{len(urls)})", 0.2 + 0.3 * i / len(urls))
 
-    status = {u: classificar(analises[u]) for u in urls}
-    dominios = sorted({normalizar_dominio(u) for u in urls})
-    dominios_oport = {normalizar_dominio(u) for u in urls if status[u] in OPORTUNIDADES}
+    log("Verificando as páginas do cliente que recebem link", 0.52)
+    destinos = verificar_destinos([l.href for a in analises.values() for l in a.links])
+
+    def dominio_de(u):
+        return achados[u].get("dominio_fonte") or normalizar_dominio(u)
+
+    status: dict[str, str] = {}
+    for u in urls:
+        a, fontes = analises[u], achados[u]["fonte"]
+        if achados[u].get("nao_resolvido"):
+            status[u] = ST_NOTICIA_NR
+        elif "Comunidade" in fontes or eh_comunidade(urlparse(u).netloc):
+            status[u] = ST_COMUNIDADE
+        else:
+            st_ = classificar(a, destinos)
+            # Busca de concorrentes que caiu numa página sem nenhum dos termos: descarta
+            if st_ == ST_NAO_ENCONTRADO and fontes == {"Concorrente"}:
+                continue
+            status[u] = st_
+    urls = [u for u in urls if u in status]
+
+    dominios = sorted({dominio_de(u) for u in urls})
+    dominios_oport = {dominio_de(u) for u in urls if status[u] in OPORTUNIDADES}
 
     # 4. DR
     drs: dict[str, float | None] = {}
@@ -723,20 +1051,22 @@ def executar(
         if erro_dr:
             avisos.append(erro_dr)
 
-    # 5. Contatos do site (um por domínio, reaproveitando o HTML dos artigos)
+    # 5. Contatos do site (não faz sentido para comunidades)
     contatos: dict[str, Contatos] = {}
-    if puxar_contatos:
+    dominios_contato = sorted({dominio_de(u) for u in urls if status[u] != ST_COMUNIDADE})
+    if puxar_contatos and dominios_contato:
         por_dominio: dict[str, list] = {}
         for u in urls:
-            por_dominio.setdefault(normalizar_dominio(u), []).append((u, analises[u].html))
+            por_dominio.setdefault(dominio_de(u), []).append((u, analises[u].html))
         with ThreadPoolExecutor(max_workers=threads) as ex:
-            futs = {ex.submit(buscar_contatos, d, por_dominio[d]): d for d in dominios}
+            futs = {ex.submit(buscar_contatos, d, por_dominio[d]): d for d in dominios_contato}
             for i, f in enumerate(as_completed(futs), 1):
                 try:
                     contatos[futs[f]] = f.result()
                 except Exception:
                     contatos[futs[f]] = Contatos()
-                log(f"Buscando contatos do site ({i}/{len(dominios)})", 0.6 + 0.2 * i / len(dominios))
+                log(f"Buscando contatos do site ({i}/{len(dominios_contato)})",
+                    0.6 + 0.2 * i / len(dominios_contato))
 
     # 6 e 7. Autor / jornalista (um por par domínio + autor)
     dados_autor: dict[tuple, dict] = {}
@@ -745,16 +1075,15 @@ def executar(
         pares_novos: set[tuple] = set()
         for u in urls:
             a = analises[u]
-            if (a.autor or a.autor_url) and u not in urls_conhecidas:
-                pares_novos.add((normalizar_dominio(u), a.autor))
-        for u in urls:
-            a = analises[u]
-            if a.autor or a.autor_url:
-                chave = (normalizar_dominio(u), a.autor)
-                if a.autor_url and not pares.get(chave):
-                    pares[chave] = a.autor_url
-                else:
-                    pares.setdefault(chave, a.autor_url)
+            if status[u] == ST_COMUNIDADE or not (a.autor or a.autor_url):
+                continue
+            chave = (dominio_de(u), a.autor)
+            if u not in urls_conhecidas:
+                pares_novos.add(chave)
+            if a.autor_url and not pares.get(chave):
+                pares[chave] = a.autor_url
+            else:
+                pares.setdefault(chave, a.autor_url)
 
         erros_hunter: list[str] = []
 
@@ -782,10 +1111,12 @@ def executar(
                 return par, info
             prioridade = ((not so_oportunidades) or d in dominios_oport) and par in pares_novos
             if perfis_google and prioridade:
-                for k, v in perfis_autor_google(nome, serper_key, buscador, pais, idioma).items():
+                achou = perfis_autor_google(nome, serper_key, lambda q, *a: buscar(q, 1, ""), pais, idioma)
+                for k, v in achou.items():
                     info.setdefault(k, v)
             if hunter_key and hunter_autor and prioridade:
                 h, erro = hunter_email_autor(d, nome, hunter_key)
+                stats["hunter"] += 1
                 if erro:
                     erros_hunter.append(erro)
                 for k, v in h.items():
@@ -806,11 +1137,12 @@ def executar(
 
     emails_veiculo: dict[str, str] = {}
     if hunter_key and hunter_veiculo:
-        dominios_novos = {normalizar_dominio(u) for u in urls if u not in urls_conhecidas}
-        alvo = sorted((dominios_oport if so_oportunidades else set(dominios)) & dominios_novos)
+        dominios_novos = {dominio_de(u) for u in urls if u not in urls_conhecidas}
+        alvo = sorted((dominios_oport if so_oportunidades else set(dominios_contato)) & dominios_novos)
         erros = []
         for i, d in enumerate(alvo, 1):
             emails_veiculo[d], erro = hunter_emails_veiculo(d, hunter_key)
+            stats["hunter"] += 1
             if erro:
                 erros.append(erro)
                 if "429" in erro or "quota" in erro.lower() or "limit" in erro.lower():
@@ -823,7 +1155,8 @@ def executar(
     linhas = []
     for u in urls:
         a, r = analises[u], achados[u]
-        d = normalizar_dominio(u)
+        d = dominio_de(u)
+        dest = [destinos.get(l.href) for l in a.links]
         linha = {
             "status": status[u],
             "dominio": d,
@@ -831,6 +1164,7 @@ def executar(
             "url": u,
             "titulo": r.get("titulo", ""),
             "termos_encontrados": ", ".join(a.termos_encontrados),
+            "concorrentes_citados": ", ".join(a.concorrentes_citados),
             "termos_busca": ", ".join(sorted(r["termos_busca"])),
             "fonte": ", ".join(sorted(r["fonte"])),
             "data_google": r.get("data", ""),
@@ -842,6 +1176,13 @@ def executar(
             "anchors": " | ".join(dict.fromkeys(l.anchor for l in a.links)),
             "urls_linkadas": " | ".join(dict.fromkeys(l.href for l in a.links)),
             "rel": " | ".join(dict.fromkeys(l.rel for l in a.links)),
+            "posicao_link": " | ".join(dict.fromkeys(l.posicao for l in a.links)),
+            "qualidade_link": qualidade_link(a),
+            "noindex": "Sim" if a.noindex else ("Não" if a.html else ""),
+            "canonical_outra": a.canonical_outra,
+            "destino_link": " | ".join(dict.fromkeys(
+                f"{st_}" + (f" → {fin}" if fin and _url_norm(fin) != _url_norm(l.href) else "")
+                for l, (st_, fin) in zip(a.links, [x or (0, "") for x in dest]))),
             "trecho_mencao": a.trecho or r.get("snippet", ""),
             "http": a.status_http,
         }
@@ -851,7 +1192,6 @@ def executar(
                       "autor_linkedin", "autor_x", "autor_instagram", "autor_muckrack"):
                 linha[k] = info.get(k, "")
             if a.autor and not autor_generico(a.autor):
-                from urllib.parse import quote_plus
                 linha["buscar_autor_muckrack"] = f"https://muckrack.com/search/results?q={quote_plus(a.autor)}"
                 linha["buscar_autor_linkedin"] = (
                     "https://www.google.com/search?q=" + quote_plus(f'"{a.autor}" site:linkedin.com/in'))
@@ -863,12 +1203,6 @@ def executar(
             linha.update(contatos[d].como_dict())
         linhas.append(linha)
 
-    ordem = {
-        "Menção sem link (oportunidade)": 0,
-        "Com backlink nofollow/sponsored/ugc": 1,
-        "Com backlink dofollow": 2,
-        "Termo não encontrado na página": 4,
-    }
-    linhas.sort(key=lambda x: (ordem.get(x["status"], 3), -(x["dr"] or -1)))
+    linhas.sort(key=lambda x: (ORDEM_STATUS.get(x["status"], 7), -(x["dr"] or -1)))
     log("Concluído", 1.0)
     return linhas, avisos
