@@ -8,7 +8,7 @@
 | 2. Digital PR | Campanhas, cobertura com 4 status, mailing, saúde das páginas, alerta diário pelo robô | Nada novo (já entregue) |
 | 3. O que dizem aí | Termômetro, assuntos, fila de resposta com IA, conversas da categoria, concorrentes nas comunidades | Gemini (já entregue) |
 | 4. Concorrentes | Comparativo, links novos, link gap, páginas mais linkadas | AHREFS_API_KEY_PAGA (código pronto, liga quando a chave entrar) |
-| 5. Links | Monitor de links conquistados, catálogo de publicações pagas, rascunho de email de outreach com IA, links tóxicos e disavow por upload | Próximo pacote |
+| 5. Links | Links tóxicos e disavow por upload (já entregue); monitor de links conquistados, catálogo de publicações pagas, rascunho de email de outreach com IA | Próximo pacote |
 | 6. Produto | Login por pessoa, relatório mensal para o cliente, alertas no Slack ou Google Chat, visibilidade em IA (GEO), share of voice, checagem de indexação | Depois |
 
 ## Como subir este pacote

@@ -20,7 +20,7 @@ for _k in ("DATABASE_URL", "SMTP_USUARIO", "SMTP_SENHA", "SMTP_HOST", "SMTP_PORT
 
 import storage  # noqa: E402
 from telas import (alertas, analista, busca_rapida, comunidades, config_cliente, digital_pr,  # noqa: E402
-                   mencoes, resumo)
+                   mencoes, resumo, toxicos_tela)
 
 # ---------------- Senha ----------------
 senha_app = segredo("APP_SENHA")
@@ -50,25 +50,16 @@ ids = [c["id"] for c in lista]
 if st.session_state.get("cid") not in ids:
     st.session_state["cid"] = ids[0] if ids else None
 
-# ---------------- Barra lateral ----------------
-with st.sidebar:
-    st.markdown("## 💬 DizemAI")
-    st.caption("Off page: menções, links, comunidades e PR")
-    if ids:
-        nomes = {c["id"]: c["nome"] for c in lista}
-        st.selectbox("Cliente", ids, format_func=lambda i: nomes[i], key="cid")
-    else:
-        st.caption("Nenhum cliente cadastrado ainda.")
-
 paginas = {
     "": [
-        st.Page(resumo.tela, title="Resumo", icon="🏠", url_path="resumo", default=True),
+        st.Page(resumo.tela, title="Resumo", url_path="resumo", default=True),
     ],
     "Monitoramento": [
         st.Page(mencoes.tela, title="Menções e links", icon="🔗", url_path="mencoes"),
         st.Page(comunidades.tela, title="O que dizem aí", icon="💬", url_path="comunidades"),
         st.Page(digital_pr.tela, title="Digital PR", icon="📣", url_path="digital-pr"),
         st.Page(analista.tela, title="Concorrentes", icon="📊", url_path="concorrentes"),
+        st.Page(toxicos_tela.tela, title="Links tóxicos", icon="☣️", url_path="toxicos"),
     ],
     "Cliente": [
         st.Page(config_cliente.tela, title="Configurações do cliente", icon="⚙️", url_path="config"),
@@ -78,7 +69,26 @@ paginas = {
         st.Page(busca_rapida.tela, title="Busca rápida", icon="🔎", url_path="busca-rapida"),
     ],
 }
-nav = st.navigation(paginas)
+# Menu montado à mão para a marca e o cliente ficarem no topo da barra lateral
+nav = st.navigation(paginas, position="hidden")
+
+# ---------------- Barra lateral ----------------
+with st.sidebar:
+    st.markdown("## 💬 DizemAI")
+    st.caption("Off page: menções, links, comunidades e PR")
+    if ids:
+        nomes = {c["id"]: c["nome"] for c in lista}
+        st.selectbox("Cliente", ids, format_func=lambda i: nomes[i], key="cid")
+    else:
+        st.caption("Nenhum cliente cadastrado ainda.")
+    for secao, pags in paginas.items():
+        if secao:
+            st.markdown(f"<div style='margin:14px 0 2px;font-size:0.8rem;color:#667085;font-weight:600'>"
+                        f"{secao.upper()}</div>", unsafe_allow_html=True)
+        else:
+            st.write("")
+        for pg in pags:
+            st.page_link(pg)
 
 if erro_banco:
     st.error(f"Não consegui conectar ao banco de dados. Confira o DATABASE_URL nos Secrets. Detalhe: {erro_banco[:300]}")

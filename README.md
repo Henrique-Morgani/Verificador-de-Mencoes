@@ -6,10 +6,11 @@ Programa de SEO off page da agência. Monitora o que dizem do cliente na web, em
 
 | Tela | O que faz |
 |---|---|
-| **Resumo** | Big numbers do período (DR com variação, backlinks, novos links, menções sem link, perdidos, comunidades), positivos, pontos de atenção, próximas ações, atualizações e resumo em texto com IA |
+| **Resumo** | Resumo executivo para baixar em PDF ou PowerPoint, big numbers do período (DR com variação, backlinks, novos links, menções sem link, perdidos, comunidades), positivos, pontos de atenção, próximas ações, atualizações e resumo em texto com IA |
 | **Menções e links** | Busca e histórico de menções na web e em notícias: status do link, qualidade, contatos, autor, outreach, ignorar, evolução mensal, Excel |
 | **O que dizem aí** | Comunidades em três abas (sobre a marca, conversas da categoria, concorrentes): termômetro contra o período anterior, assuntos, fila "Precisa de resposta" com sugestão de resposta pela IA e status da conversa |
 | **Digital PR** | Campanhas com termos e página(s) próprias; cobertura com 4 status de link; KPIs; matérias por dia; mailing com cruzamento automático; saúde das páginas; alerta diário nos primeiros dias |
+| **Links tóxicos** | Sobe a lista de links (export do Ahrefs, Semrush, Search Console, planilha ou lista colada), pontua cada domínio de 0 a 100 com os motivos, decisão por domínio e arquivo de disavow (junta com o disavow atual, se houver) |
 | **Concorrentes** | Comparativo (DR, domínios de referência, backlinks, tráfego), evolução de 6 meses, links novos dos concorrentes, link gap (envia para o outreach) e páginas mais linkadas |
 | **Configurações do cliente** | Termos, termos negativos, frases da categoria, concorrentes (Nome \| site), comunidades, busca manual e do robô |
 | **Alertas e ignorados** | Emails automáticos (quinzenal, semanal ou mensal) e lista de ignorados |
@@ -25,6 +26,9 @@ Programa de SEO off page da agência. Monitora o que dizem do cliente na web, em
 | `core.py` | Motor de busca e análise das páginas |
 | `fluxo.py` | Busca completa de um cliente (usada pelo app e pelo robô) |
 | `pr.py` | Digital PR: status das matérias, busca da cobertura, mailing |
+| `resumo_dados.py` | Números e destaques do Resumo |
+| `executivo.py` | Gera o resumo executivo em PDF e PowerPoint |
+| `toxicos.py` | Leitura das listas, pontuação de links tóxicos e disavow |
 | `concorrentes.py` | Análise de concorrentes e link gap |
 | `provedores.py` | Camada de dados de backlinks: Ahrefs agora, Semrush depois |
 | `ia.py` | Gemini: sentimento, assunto, sugestão de resposta e resumo |

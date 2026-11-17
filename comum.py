@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -261,14 +261,3 @@ def mostrar_mencoes(df: pd.DataFrame | None, historico: bool, cid: int | None = 
 
     exportar(vis, df, colunas, nome_base)
 
-
-def delta_dr(cid: int, dominio: str, dias: int = 30):
-    """(DR atual, variação contra o registro mais próximo de N dias atrás)."""
-    hist = storage.historico_dr(cid, dominio)
-    if not hist:
-        return None, None
-    atual = hist[-1][1]
-    corte = storage.agora() - timedelta(days=dias)
-    antes = [v for d, v in hist if d <= corte]
-    base = antes[-1] if antes else hist[0][1]
-    return atual, (atual - base) if len(hist) > 1 else None
