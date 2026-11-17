@@ -86,13 +86,13 @@ def montar(cliente: dict, nov: dict, desde: datetime, ate: datetime) -> tuple[st
     partes_assunto = [f"{len(nl)} novo(s) backlink(s)", f"{len(op)} menção(ões) sem link"]
     if perg:
         partes_assunto.append(f"{len(perg)} pergunta(s) em comunidades")
-    assunto = f"[Menções] {cliente['nome']}: " + ", ".join(partes_assunto) + f" ({periodo})"
+    assunto = f"[DizemAI] {cliente['nome']}: " + ", ".join(partes_assunto) + f" ({periodo})"
     if neg:
         assunto = f"⚠️ NEGATIVA | {len(neg)} menção(ões) negativa(s) em comunidades | " + assunto
 
     blocos = [f"""
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:860px;margin:auto;color:#222">
-    <h2 style="margin-bottom:4px">Relatório de menções: {_e(cliente['nome'])}</h2>
+    <h2 style="margin-bottom:4px">DizemAI · relatório de {_e(cliente['nome'])}</h2>
     <p style="color:#666;margin-top:0">{_e(cliente['url'])} · período de {periodo}</p>
     <table style="margin:16px 0 8px"><tr>
       {_card(len(nl), "novos backlinks", "#ecfdf3", "#067647")}
@@ -147,6 +147,19 @@ def montar(cliente: dict, nov: dict, desde: datetime, ate: datetime) -> tuple[st
             ["Domínio", "DR", "Página", "Concorrentes citados", "Contato"],
             [[_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
               _e(m.get("concorrentes_citados", "")), _contato(m)] for m in prosp[:30]]))
+    cat = nov.get("categoria", [])
+    if cat:
+        blocos.append(_titulo_secao("💡 Pedidos de indicação na categoria (sem citar a marca)", "#1a56db"))
+        blocos.append(_tabela(
+            ["Onde", "Post", "Resumo"],
+            [[_e(m.get("dominio")), _link(m["url"], m.get("titulo") or None), _e(m.get("motivo_sentimento", ""))]
+             for m in cat[:20]]))
+    camps = nov.get("campanhas", [])
+    if camps:
+        blocos.append(_titulo_secao("📣 Campanhas de Digital PR"))
+        blocos.append(_tabela(
+            ["Campanha", "Matérias no período", "Linkaram para a campanha (total)", "Citaram sem link (total)"],
+            [[_e(c["nome"]), str(c["novas_periodo"]), str(c["campanha"]), str(c["sem_link"])] for c in camps]))
     if outras:
         blocos.append(_titulo_secao("Outras menções em comunidades"))
         blocos.append(_tabela(
@@ -154,17 +167,48 @@ def montar(cliente: dict, nov: dict, desde: datetime, ate: datetime) -> tuple[st
             [[_e(m.get("dominio")), _link(m["url"], m.get("titulo") or None),
               _e(m.get("sentimento", "") or "não classificada"), _e(m.get("motivo_sentimento", ""))]
              for m in outras]))
-    if not (nl or op or perd or neg or perg or outras or prosp or queb):
+    if not (nl or op or perd or neg or perg or outras or prosp or queb or cat):
         blocos.append('<p style="padding:16px;background:#f9fafb;border-radius:8px">'
                       "Nenhuma novidade neste período. O monitoramento continua ativo.</p>")
 
     app_url = os.getenv("APP_URL", "")
-    rodape = "Enviado automaticamente pelo Verificador de Menções."
+    rodape = "Enviado automaticamente pelo DizemAI."
     if app_url:
         rodape += f' Veja o histórico completo em {_link(app_url, app_url)}.'
     blocos.append(f'<p style="color:#888;font-size:12px;margin-top:32px">{rodape} '
                   "Domain Rating by Ahrefs.</p></div>")
     return assunto, "".join(blocos)
+
+
+STATUS_COR = {"Linkou para a campanha": "#067647", "Linkou para o site": "#1a56db", "Citou sem link": "#b54708",
+             "Link da campanha quebrado": "#b42318"}
+
+
+def montar_campanha(cliente: dict, camp: dict, novas: list[dict], ind: dict) -> tuple[str, str]:
+    """Email do alerta diário de Digital PR: só as matérias novas desde o último envio."""
+    assunto = f"[DizemAI PR] {camp['nome']}: {len(novas)} matéria(s) nova(s)"
+    linhas = []
+    for m in sorted(novas, key=lambda x: -(x.get("dr") or -1)):
+        cor = STATUS_COR.get(m.get("status_campanha"), "#555")
+        linhas.append([_e(m.get("dominio")), _dr(m), _link(m["url"], m.get("titulo") or None),
+                       f'<b style="color:{cor}">{_e(m.get("status_campanha"))}</b>', _contato(m)])
+    corpo = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:860px;margin:auto;color:#222">
+    <h2 style="margin-bottom:4px">Cobertura nova: {_e(camp['nome'])}</h2>
+    <p style="color:#666;margin-top:0">{_e(cliente['nome'])} · lançamento em {_e(camp.get('lancamento'))}</p>
+    <table style="margin:16px 0 8px"><tr>
+      {_card(ind['materias'], "matérias no total", "#f2f4f7", "#344054")}
+      {_card(ind['campanha'], "linkaram para a campanha", "#ecfdf3", "#067647")}
+      {_card(ind['site'], "linkaram só para o site", "#eff4ff", "#1a56db")}
+      {_card(ind['sem_link'], "citaram sem link", "#fff7e6", "#b54708")}
+    </tr></table>
+    {_titulo_secao("Matérias novas")}
+    {_tabela(["Veículo", "DR", "Matéria", "Link", "Contato"], linhas)}
+    <p style="color:#555;font-size:13px">Quem citou sem link ou linkou só para a home é candidato a pedido de ajuste
+    do link para a página da campanha.</p>
+    <p style="color:#888;font-size:12px;margin-top:32px">Enviado automaticamente pelo DizemAI.
+    Domain Rating by Ahrefs.</p></div>"""
+    return assunto, corpo
 
 
 def enviar(para: str, assunto: str, corpo_html: str):
@@ -178,7 +222,7 @@ def enviar(para: str, assunto: str, corpo_html: str):
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = assunto
-    msg["From"] = f"Verificador de Menções <{remetente}>"
+    msg["From"] = f"DizemAI <{remetente}>"
     msg["To"] = para
     msg.attach(MIMEText("Abra este email em um leitor com suporte a HTML.", "plain", "utf-8"))
     msg.attach(MIMEText(corpo_html, "html", "utf-8"))

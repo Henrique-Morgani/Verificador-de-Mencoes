@@ -24,6 +24,12 @@ ST_SEM_LINK = "Menção sem link (oportunidade)"
 ST_COMUNIDADE = "Menção em comunidade"
 ST_PROSPECT = "Prospect: cita concorrente"
 ST_NAO_ENCONTRADO = "Termo não encontrado na página"
+ST_CATEGORIA = "Conversa da categoria"
+ST_COMUNIDADE_CONC = "Concorrente em comunidade"
+ST_GAP = "Prospect: link gap"
+STATUS_SOCIAIS = {ST_COMUNIDADE, ST_CATEGORIA, ST_COMUNIDADE_CONC}
+CONVERSA_OPCOES = ["Nova", "Em análise", "Respondida", "Orientação enviada ao cliente", "Ignorar"]
+CONVERSA_PENDENTES = {"Nova", "Em análise"}
 
 STATUS_COM_LINK = {ST_DOFOLLOW, ST_NOFOLLOW, ST_QUEBRADO}
 STATUS_FALHA = {"Erro ao acessar"}
@@ -60,7 +66,88 @@ mencoes = Table(
     Column("outreach_status", String(40)),
     Column("outreach_data", DateTime(timezone=True)),
     Column("outreach_obs", Text),
+    Column("conversa_status", String(40)),
+    Column("conversa_obs", Text),
+    Column("conversa_resposta", Text),
+    Column("conversa_data", DateTime(timezone=True)),
     UniqueConstraint("cliente_id", "url", name="uq_cliente_url"),
+)
+
+dr_historico = Table(
+    "dr_historico", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("cliente_id", Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False),
+    Column("dominio", String(300), nullable=False),
+    Column("data", DateTime(timezone=True)),
+    Column("dr", Float),
+)
+
+campanhas = Table(
+    "campanhas", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("cliente_id", Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False),
+    Column("nome", String(200), nullable=False),
+    Column("lancamento", String(10)),             # AAAA-MM-DD
+    Column("termos", Text),                       # JSON
+    Column("paginas", Text),                      # JSON: URLs da campanha
+    Column("status", String(20), default="ativa"),  # rascunho | ativa | encerrada
+    Column("dias_alerta", Integer, default=14),
+    Column("paginas_status", Text),               # JSON {url: [status, url_final]}
+    Column("ultima_busca", DateTime(timezone=True)),
+    Column("ultimo_envio", DateTime(timezone=True)),
+    Column("criado_em", DateTime(timezone=True)),
+)
+
+cobertura = Table(
+    "cobertura", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("campanha_id", Integer, ForeignKey("campanhas.id", ondelete="CASCADE"), nullable=False),
+    Column("url", String(1000), nullable=False),
+    Column("dominio", String(300)),
+    Column("dr", Float),
+    Column("status_link", String(60)),
+    Column("dados", Text),
+    Column("primeira_vez", DateTime(timezone=True)),
+    Column("ultima_vez", DateTime(timezone=True)),
+    Column("outreach_status", String(40)),
+    Column("outreach_obs", Text),
+    UniqueConstraint("campanha_id", "url", name="uq_campanha_url"),
+)
+
+mailing = Table(
+    "mailing", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("campanha_id", Integer, ForeignKey("campanhas.id", ondelete="CASCADE"), nullable=False),
+    Column("jornalista", String(200)),
+    Column("veiculo", String(200)),
+    Column("dominio", String(300)),
+    Column("email", String(300)),
+    Column("status", String(40)),
+    Column("obs", Text),
+    Column("atualizado_em", DateTime(timezone=True)),
+)
+
+concorrentes_snapshot = Table(
+    "concorrentes_snapshot", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("cliente_id", Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False),
+    Column("dominio", String(300), nullable=False),
+    Column("data", DateTime(timezone=True)),
+    Column("provedor", String(20)),
+    Column("dr", Float),
+    Column("backlinks", Integer),
+    Column("refdomains", Integer),
+    Column("trafego", Integer),
+    Column("keywords", Integer),
+)
+
+analises = Table(
+    "analises", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("cliente_id", Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False),
+    Column("tipo", String(40), nullable=False),
+    Column("criado_em", DateTime(timezone=True)),
+    Column("dados", Text),
 )
 
 execucoes = Table(
@@ -91,7 +178,8 @@ ignorados = Table(
 # Colunas acrescentadas depois da primeira versão (o banco já existente recebe via ALTER TABLE)
 _COLUNAS_NOVAS = {
     "mencoes": {"outreach_status": "VARCHAR(40)", "outreach_data": "TIMESTAMP WITH TIME ZONE",
-                "outreach_obs": "TEXT"},
+                "outreach_obs": "TEXT", "conversa_status": "VARCHAR(40)", "conversa_obs": "TEXT",
+                "conversa_resposta": "TEXT", "conversa_data": "TIMESTAMP WITH TIME ZONE"},
 }
 
 inscricoes = Table(
@@ -187,6 +275,11 @@ def salvar_cliente(nome: str, url: str, termos: list[str], config: dict, cid: in
 
 def excluir_cliente(cid: int):
     with engine().begin() as c:
+        for camp_id, in c.execute(select(campanhas.c.id).where(campanhas.c.cliente_id == cid)).all():
+            c.execute(delete(cobertura).where(cobertura.c.campanha_id == camp_id))
+            c.execute(delete(mailing).where(mailing.c.campanha_id == camp_id))
+        for t in (campanhas, dr_historico, concorrentes_snapshot, analises):
+            c.execute(delete(t).where(t.c.cliente_id == cid))
         c.execute(delete(execucoes).where(execucoes.c.cliente_id == cid))
         c.execute(delete(ignorados).where(ignorados.c.cliente_id == cid))
         c.execute(delete(mencoes).where(mencoes.c.cliente_id == cid))
@@ -196,14 +289,15 @@ def excluir_cliente(cid: int):
 
 # ---------------------------------------------------------------- menções
 
-def urls_do_cliente(cid: int, so_relevantes: bool = True) -> list[str]:
-    """URLs já conhecidas. so_relevantes: ignora as que não tinham o termo."""
+def urls_do_cliente(cid: int, so_relevantes: bool = True, sem_sociais: bool = False) -> list[str]:
+    """URLs já conhecidas. so_relevantes: ignora as que não tinham o termo.
+    sem_sociais: tira comunidades e conversas (não vale a pena reabrir essas páginas)."""
     q = select(mencoes.c.url, mencoes.c.status).where(mencoes.c.cliente_id == cid)
     with engine().connect() as c:
         rows = c.execute(q).all()
-    if so_relevantes:
-        return [u for u, s in rows if s != "Termo não encontrado na página"]
-    return [u for u, _ in rows]
+    return [u for u, s in rows
+            if not (so_relevantes and s == ST_NAO_ENCONTRADO) and not (sem_sociais and s in STATUS_SOCIAIS)
+            and s != ST_GAP]
 
 
 def salvar_resultados(cid: int, linhas: list[dict], quando: datetime | None = None) -> dict:
@@ -299,6 +393,9 @@ def mencoes_do_cliente(cid: int, incluir_ignorados: bool = False) -> list[dict]:
             link_desde=_tz(r["link_desde"]), perdeu_link_em=_tz(r["perdeu_link_em"]),
             outreach_status=r["outreach_status"] or "Não contatado",
             outreach_data=_tz(r["outreach_data"]), outreach_obs=r["outreach_obs"] or "",
+            conversa_status=r["conversa_status"] or ("Nova" if r["status"] in STATUS_SOCIAIS else ""),
+            conversa_obs=r["conversa_obs"] or "", conversa_resposta=r["conversa_resposta"] or "",
+            conversa_data=_tz(r["conversa_data"]),
         )
         saida.append(d)
     return saida
@@ -484,10 +581,13 @@ def novidades(cid: int, desde: datetime) -> dict:
                       and m.get("sentimento") != "negativa"],
         "comunidade_outras": [m for m in comunidade_novas if m.get("sentimento") != "negativa"
                               and m.get("pergunta_indicacao") != "Sim"],
-        "prospects": por_dr([m for m in todas if m["status"] == ST_PROSPECT
+        "prospects": por_dr([m for m in todas if m["status"] in (ST_PROSPECT, ST_GAP)
                              and desde_data(m["primeira_vez"])]),
+        "categoria": [m for m in todas if m["status"] == ST_CATEGORIA and desde_data(m["primeira_vez"])
+                      and m.get("pergunta_indicacao") == "Sim"],
         "total_links": sum(1 for m in todas if m["status"] in STATUS_COM_LINK),
-        "total_mencoes": sum(1 for m in todas if m["status"] not in (ST_NAO_ENCONTRADO, ST_PROSPECT)),
+        "total_mencoes": sum(1 for m in todas if m["status"] not in
+                             (ST_NAO_ENCONTRADO, ST_PROSPECT, ST_GAP, ST_CATEGORIA, ST_COMUNIDADE_CONC)),
     }
 
 
@@ -544,3 +644,211 @@ def inscricao_vencida(i: dict, quando: datetime | None = None) -> bool:
 def inicio_periodo(i: dict) -> datetime:
     """Desde quando contar as novidades de uma inscrição."""
     return i["ultimo_envio"] or i["criado_em"] or (agora() - timedelta(days=i["frequencia_dias"]))
+
+
+
+# ---------------------------------------------------------------- conversas (O que dizem aí)
+
+def definir_conversa(cid: int, urls: list[str], status: str | None = None, obs: str | None = None,
+                     resposta: str | None = None):
+    with engine().begin() as c:
+        for u in urls:
+            valores = {}
+            if status:
+                valores["conversa_status"] = status
+                if status not in CONVERSA_PENDENTES:
+                    valores["conversa_data"] = agora()
+            if obs is not None:
+                valores["conversa_obs"] = obs
+            if resposta is not None:
+                valores["conversa_resposta"] = resposta
+            if valores:
+                c.execute(update(mencoes).where((mencoes.c.cliente_id == cid) & (mencoes.c.url == u))
+                          .values(**valores))
+
+
+# ---------------------------------------------------------------- histórico de DR
+
+def registrar_dr(cid: int, dominio: str, dr, quando: datetime | None = None):
+    if dr is None:
+        return
+    with engine().begin() as c:
+        c.execute(insert(dr_historico).values(cliente_id=cid, dominio=dominio, dr=float(dr), data=quando or agora()))
+
+
+def historico_dr(cid: int, dominio: str) -> list[tuple[datetime, float]]:
+    with engine().connect() as c:
+        rows = c.execute(select(dr_historico.c.data, dr_historico.c.dr)
+                         .where((dr_historico.c.cliente_id == cid) & (dr_historico.c.dominio == dominio))
+                         .order_by(dr_historico.c.data)).all()
+    return [(_tz(d), v) for d, v in rows]
+
+
+# ---------------------------------------------------------------- campanhas de Digital PR
+
+def _campanha(r) -> dict:
+    d = dict(r)
+    d["termos"] = json.loads(d["termos"] or "[]")
+    d["paginas"] = json.loads(d["paginas"] or "[]")
+    d["paginas_status"] = json.loads(d["paginas_status"] or "{}")
+    for k in ("ultima_busca", "ultimo_envio", "criado_em"):
+        d[k] = _tz(d[k])
+    return d
+
+
+def listar_campanhas(cid: int | None = None, status: str | None = None) -> list[dict]:
+    q = select(campanhas)
+    if cid is not None:
+        q = q.where(campanhas.c.cliente_id == cid)
+    if status:
+        q = q.where(campanhas.c.status == status)
+    with engine().connect() as c:
+        rows = c.execute(q.order_by(campanhas.c.lancamento.desc())).mappings().all()
+    return [_campanha(r) for r in rows]
+
+
+def obter_campanha(camp_id: int) -> dict | None:
+    with engine().connect() as c:
+        r = c.execute(select(campanhas).where(campanhas.c.id == camp_id)).mappings().first()
+    return _campanha(r) if r else None
+
+
+def salvar_campanha(cid: int, nome: str, lancamento: str, termos: list[str], paginas: list[str],
+                    status: str = "ativa", dias_alerta: int = 14, camp_id: int | None = None) -> int:
+    valores = dict(cliente_id=cid, nome=nome.strip(), lancamento=lancamento, status=status,
+                   termos=json.dumps([t for t in termos if t.strip()], ensure_ascii=False),
+                   paginas=json.dumps([p for p in paginas if p.strip()], ensure_ascii=False),
+                   dias_alerta=int(dias_alerta))
+    with engine().begin() as c:
+        if camp_id:
+            c.execute(update(campanhas).where(campanhas.c.id == camp_id).values(**valores))
+            return camp_id
+        return c.execute(insert(campanhas).values(**valores, criado_em=agora())).inserted_primary_key[0]
+
+
+def excluir_campanha(camp_id: int):
+    with engine().begin() as c:
+        c.execute(delete(cobertura).where(cobertura.c.campanha_id == camp_id))
+        c.execute(delete(mailing).where(mailing.c.campanha_id == camp_id))
+        c.execute(delete(campanhas).where(campanhas.c.id == camp_id))
+
+
+def atualizar_campanha(camp_id: int, **valores):
+    if "paginas_status" in valores:
+        valores["paginas_status"] = json.dumps(valores["paginas_status"], ensure_ascii=False)
+    with engine().begin() as c:
+        c.execute(update(campanhas).where(campanhas.c.id == camp_id).values(**valores))
+
+
+def salvar_cobertura(camp_id: int, linhas: list[dict], quando: datetime | None = None) -> dict:
+    """Junta matérias novas e atualiza o status do link das conhecidas."""
+    quando = quando or agora()
+    resumo = {"novas": 0, "mudaram": 0}
+    with engine().begin() as c:
+        existentes = {r["url"]: dict(r) for r in c.execute(
+            select(cobertura).where(cobertura.c.campanha_id == camp_id)).mappings()}
+        for ln in linhas:
+            ln = _limpo(ln)
+            ant = existentes.get(ln["url"])
+            if ant is None:
+                c.execute(insert(cobertura).values(
+                    campanha_id=camp_id, url=ln["url"], dominio=ln.get("dominio"), dr=ln.get("dr"),
+                    status_link=ln.get("status_campanha"), primeira_vez=quando, ultima_vez=quando,
+                    dados=json.dumps(ln, ensure_ascii=False, default=str), outreach_status=None))
+                resumo["novas"] += 1
+                continue
+            if ln.get("status") in STATUS_FALHA:
+                continue
+            dados_ant = json.loads(ant["dados"] or "{}")
+            for k, v in dados_ant.items():
+                if ln.get(k) in (None, "", []) and v not in (None, ""):
+                    ln[k] = v
+            valores = dict(ultima_vez=quando, status_link=ln.get("status_campanha"),
+                           dr=ln.get("dr") if ln.get("dr") is not None else ant["dr"],
+                           dados=json.dumps(ln, ensure_ascii=False, default=str))
+            if ant["status_link"] != ln.get("status_campanha"):
+                resumo["mudaram"] += 1
+                if ln.get("status_campanha") == "Linkou para a campanha" and \
+                        ant["outreach_status"] in ("Contatado", "Respondeu"):
+                    valores["outreach_status"] = "Link conquistado"
+            c.execute(update(cobertura).where(cobertura.c.id == ant["id"]).values(**valores))
+        c.execute(update(campanhas).where(campanhas.c.id == camp_id).values(ultima_busca=quando))
+    return resumo
+
+
+def cobertura_da_campanha(camp_id: int) -> list[dict]:
+    with engine().connect() as c:
+        rows = c.execute(select(cobertura).where(cobertura.c.campanha_id == camp_id)).mappings().all()
+    saida = []
+    for r in rows:
+        d = json.loads(r["dados"] or "{}")
+        d.update(url=r["url"], dominio=r["dominio"], dr=r["dr"], status_campanha=r["status_link"],
+                 primeira_vez=_tz(r["primeira_vez"]), ultima_vez=_tz(r["ultima_vez"]),
+                 outreach_status=r["outreach_status"] or "Não contatado", outreach_obs=r["outreach_obs"] or "")
+        saida.append(d)
+    return saida
+
+
+def outreach_cobertura(camp_id: int, urls: list[str], status: str, obs: str | None = None):
+    with engine().begin() as c:
+        for u in urls:
+            v = {"outreach_status": status}
+            if obs:
+                v["outreach_obs"] = obs
+            c.execute(update(cobertura).where((cobertura.c.campanha_id == camp_id) & (cobertura.c.url == u))
+                      .values(**v))
+
+
+def listar_mailing(camp_id: int) -> list[dict]:
+    with engine().connect() as c:
+        rows = c.execute(select(mailing).where(mailing.c.campanha_id == camp_id)
+                         .order_by(mailing.c.id)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def salvar_mailing(camp_id: int, linhas: list[dict]):
+    """Substitui o mailing da campanha pelas linhas da tabela editada na tela."""
+    with engine().begin() as c:
+        c.execute(delete(mailing).where(mailing.c.campanha_id == camp_id))
+        for ln in linhas:
+            if not any(str(ln.get(k) or "").strip() for k in ("jornalista", "veiculo", "email")):
+                continue
+            dom = str(ln.get("dominio") or "").strip().lower()
+            dom = dom.replace("https://", "").replace("http://", "").split("/")[0]
+            dom = dom[4:] if dom.startswith("www.") else dom
+            c.execute(insert(mailing).values(
+                campanha_id=camp_id, jornalista=ln.get("jornalista"), veiculo=ln.get("veiculo"),
+                dominio=dom, email=ln.get("email"), status=ln.get("status") or "Enviado",
+                obs=ln.get("obs"), atualizado_em=agora()))
+
+
+# ---------------------------------------------------------------- concorrentes (dados do provedor)
+
+def salvar_snapshot(cid: int, dados: list[dict], provedor: str, quando: datetime | None = None):
+    with engine().begin() as c:
+        for d in dados:
+            c.execute(insert(concorrentes_snapshot).values(
+                cliente_id=cid, dominio=d["dominio"], data=quando or agora(), provedor=provedor,
+                dr=d.get("dr"), backlinks=d.get("backlinks"), refdomains=d.get("refdomains"),
+                trafego=d.get("trafego"), keywords=d.get("keywords")))
+
+
+def snapshots(cid: int) -> list[dict]:
+    with engine().connect() as c:
+        rows = c.execute(select(concorrentes_snapshot).where(concorrentes_snapshot.c.cliente_id == cid)
+                         .order_by(concorrentes_snapshot.c.data)).mappings().all()
+    return [{**dict(r), "data": _tz(r["data"])} for r in rows]
+
+
+def salvar_analise(cid: int, tipo: str, dados) -> None:
+    with engine().begin() as c:
+        c.execute(insert(analises).values(cliente_id=cid, tipo=tipo, criado_em=agora(),
+                                          dados=json.dumps(dados, ensure_ascii=False, default=str)))
+
+
+def ultima_analise(cid: int, tipo: str) -> tuple[datetime | None, object]:
+    with engine().connect() as c:
+        r = c.execute(select(analises.c.criado_em, analises.c.dados)
+                      .where((analises.c.cliente_id == cid) & (analises.c.tipo == tipo))
+                      .order_by(analises.c.criado_em.desc()).limit(1)).first()
+    return (_tz(r[0]), json.loads(r[1] or "null")) if r else (None, None)

@@ -17,7 +17,8 @@ PADRAO = {
     "hunter_autor": False, "hunter_veiculo": False, "so_oportunidades": True,
     "excluir": core.EXCLUIR_PADRAO, "periodo_monitoramento": "m", "paginas_monitoramento": 2,
     "comunidades": core.COMUNIDADES_PADRAO, "concorrentes": [], "dominios_concorrentes": [],
-    "paginas_concorrentes": 1,
+    "paginas_concorrentes": 1, "termos_negativos": [], "frases_categoria": [],
+    "comunidades_concorrentes": True,
 }
 
 
@@ -41,7 +42,9 @@ def parametros(cfg: dict, chaves: dict, robo: bool = False) -> dict:
         hunter_veiculo=c["hunter_veiculo"] and bool(chaves.get("hunter")),
         so_oportunidades=c["so_oportunidades"], comunidades=c["comunidades"],
         concorrentes=c["concorrentes"], dominios_concorrentes=c["dominios_concorrentes"],
-        paginas_concorrentes=c["paginas_concorrentes"],
+        paginas_concorrentes=c["paginas_concorrentes"], termos_negativos=c["termos_negativos"],
+        frases_categoria=c["frases_categoria"],
+        comunidades_concorrentes=bool(c["comunidades_concorrentes"] and c["concorrentes"]),
     )
 
 
@@ -53,7 +56,7 @@ def rodar_cliente(cliente: dict, origem: str = "manual", chaves: dict | None = N
     executar = executar or core.executar
     cid = cliente["id"]
     inicio = storage.agora()
-    conhecidas = storage.urls_do_cliente(cid)
+    conhecidas = storage.urls_do_cliente(cid, sem_sociais=True)
     ign_urls, ign_doms = storage.conjuntos_ignorados(cid)
     stats: dict = {}
     linhas, avisos = executar(
@@ -68,4 +71,11 @@ def rodar_cliente(cliente: dict, origem: str = "manual", chaves: dict | None = N
         avisos.append(aviso_ia)
     resumo = storage.salvar_resultados(cid, linhas, inicio)
     storage.registrar_execucao(cid, inicio, origem, stats, resumo)
+    # Histórico do DR do próprio cliente (endpoint gratuito da Ahrefs)
+    try:
+        dom = core.normalizar_dominio(cliente["url"])
+        drs, _ = core.buscar_dr([dom], chaves.get("ahrefs", ""))
+        storage.registrar_dr(cid, dom, drs.get(dom), inicio)
+    except Exception:
+        pass
     return resumo, avisos, stats

@@ -59,6 +59,8 @@ ST_COMUNIDADE = "Menção em comunidade"
 ST_PROSPECT = "Prospect: cita concorrente"
 ST_NAO_ENCONTRADO = "Termo não encontrado na página"
 ST_NOTICIA_NR = "Notícia (URL não resolvida)"
+ST_CATEGORIA = "Conversa da categoria"
+ST_COMUNIDADE_CONC = "Concorrente em comunidade"
 
 REDES = {
     "Instagram": "instagram.com",
@@ -102,6 +104,25 @@ def pertence_ao_dominio(host: str, dominio: str) -> bool:
     if host.startswith("www."):
         host = host[4:]
     return host == dominio or host.endswith("." + dominio)
+
+
+def regex_termo(termo: str):
+    """Termo como palavra inteira, sem acento e sem diferenciar maiúsculas."""
+    return re.compile(r"(?<!\w)" + re.escape(sem_acento(termo).strip()) + r"(?!\w)")
+
+
+def limpar_negativos(texto_norm: str, negativos) -> str:
+    """Apaga (com espaços, mantendo as posições) os trechos que batem com termos negativos."""
+    for n in negativos or []:
+        if n.strip():
+            texto_norm = regex_termo(n).sub(lambda m: " " * len(m.group()), texto_norm)
+    return texto_norm
+
+
+def menciona(texto: str, termos, negativos=None) -> list:
+    """Quais termos aparecem no texto como palavra inteira, ignorando os negativos."""
+    t = limpar_negativos(sem_acento(texto or ""), negativos)
+    return [x for x in termos if x.strip() and regex_termo(x).search(t)]
 
 
 def sem_acento(txt: str) -> str:
@@ -162,13 +183,18 @@ def _palavras(q: str) -> int:
     return len(q.replace("(", " ").replace(")", " ").replace('"', " ").split())
 
 
-def montar_query(termos, dominio_cliente: str, excluir: list[str], extra: str = "") -> str:
-    """Todos os termos numa busca só (OR), excluindo o cliente e, se couber, outros domínios."""
+def montar_query(termos, dominio_cliente: str, excluir: list[str], extra: str = "",
+                 negativos=None) -> str:
+    """Todos os termos numa busca só (OR), sem o cliente, sem os termos negativos e, se couber, sem outros domínios."""
     if isinstance(termos, str):
         termos = [termos]
     q = grupo_or(termos) + (f" {extra}" if extra else "")
     if dominio_cliente:
         q += f" -site:{dominio_cliente}"
+    for n in negativos or []:
+        n = n.strip().replace('"', "")
+        if n and _palavras(q) + len(n.split()) <= LIMITE_PALAVRAS_GOOGLE:
+            q += ' -"' + n + '"'
     for d in excluir or []:
         if d and _palavras(q) + 1 <= LIMITE_PALAVRAS_GOOGLE:
             q += f" -site:{d}"
@@ -221,7 +247,9 @@ def buscar_noticias_rss(termos: list[str], dominio_cliente: str, pais: str = "br
     q = grupo_or(termos)
     if dominio_cliente:
         q += f" -site:{dominio_cliente}"
-    if periodo in QUANDO_NEWS:
+    if periodo.startswith("desde:"):
+        q += f" after:{periodo[6:16]}"
+    elif periodo in QUANDO_NEWS:
         q += f" when:{QUANDO_NEWS[periodo]}"
     url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl={hl}&gl={gl}&ceid={ceid}"
     try:
@@ -274,7 +302,10 @@ def buscar_serper(
     resultados = []
     for pagina in range(1, paginas + 1):
         corpo = {"q": query, "gl": pais, "hl": idioma, "num": 10, "page": pagina}
-        if periodo:
+        if periodo.startswith("desde:"):
+            a, m, d = periodo[6:16].split("-")
+            corpo["tbs"] = f"cdr:1,cd_min:{int(m)}/{int(d)}/{a}"
+        elif periodo:
             corpo["tbs"] = f"qdr:{periodo}"
         r = requests.post(
             f"https://google.serper.dev/{tipo}",
@@ -360,7 +391,7 @@ class AnalisePagina:
 
 def analisar_pagina(
     url: str, dominio_cliente: str, termos: list[str], sessao=None,
-    termos_concorrentes: list[str] | None = None,
+    termos_concorrentes: list[str] | None = None, termos_negativos: list[str] | None = None,
 ) -> AnalisePagina:
     a = AnalisePagina()
     a.status_http, a.url_final, a.html, cab = baixar_completo(url, sessao)
@@ -408,20 +439,22 @@ def analisar_pagina(
     for t in soup(["script", "style", "noscript", "template"]):
         t.decompose()
     texto = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    texto_norm = sem_acento(texto)
+    texto_norm = limpar_negativos(sem_acento(texto), termos_negativos)
+    if len(texto_norm) != len(texto):  # segurança: posições precisam bater com o texto original
+        texto = texto_norm
 
     for termo in termos:
-        tn = sem_acento(termo)
-        pos = texto_norm.find(tn)
-        if pos >= 0:
+        mt = regex_termo(termo).search(texto_norm) if termo.strip() else None
+        if mt:
+            pos = mt.start()
             a.termos_encontrados.append(termo)
             if not a.trecho:
                 ini, fim = max(0, pos - 120), min(len(texto), pos + len(termo) + 120)
                 a.trecho = ("…" if ini else "") + texto[ini:fim] + ("…" if fim < len(texto) else "")
     for termo in termos_concorrentes or []:
-        tn = sem_acento(termo)
-        pos = texto_norm.find(tn)
-        if pos >= 0:
+        mt = regex_termo(termo).search(texto_norm) if termo.strip() else None
+        if mt:
+            pos = mt.start()
             a.concorrentes_citados.append(termo)
             if not a.termos_encontrados and not a.trecho:
                 ini, fim = max(0, pos - 120), min(len(texto), pos + len(termo) + 120)
@@ -864,7 +897,8 @@ def classificar(a: AnalisePagina, destinos: dict | None = None) -> str:
 
 OPORTUNIDADES = {ST_SEM_LINK, ST_NOFOLLOW, ST_QUEBRADO, ST_PROSPECT}
 ORDEM_STATUS = {ST_SEM_LINK: 0, ST_QUEBRADO: 1, ST_PROSPECT: 2, ST_COMUNIDADE: 3, ST_NOFOLLOW: 4,
-                ST_DOFOLLOW: 5, ST_NOTICIA_NR: 6, ST_NAO_ENCONTRADO: 9}
+                ST_DOFOLLOW: 5, ST_NOTICIA_NR: 6, ST_CATEGORIA: 7, ST_COMUNIDADE_CONC: 8, ST_NAO_ENCONTRADO: 9}
+STATUS_SOCIAIS = {ST_COMUNIDADE, ST_CATEGORIA, ST_COMUNIDADE_CONC}
 
 
 def executar(
@@ -890,6 +924,10 @@ def executar(
     concorrentes: list[str] | None = None,
     dominios_concorrentes: list[str] | None = None,
     paginas_concorrentes: int = 1,
+    termos_negativos: list[str] | None = None,
+    frases_categoria: list[str] | None = None,
+    comunidades_concorrentes: bool = False,
+    buscar_prospects: bool = False,
     ignorar_urls: set[str] | None = None,
     ignorar_dominios: set[str] | None = None,
     urls_extras: list[str] | None = None,
@@ -926,6 +964,9 @@ def executar(
     comunidades = [normalizar_dominio(c) for c in (comunidades or []) if c.strip()]
     concorrentes = [c.strip() for c in (concorrentes or []) if c.strip()]
     dominios_concorrentes = [normalizar_dominio(d) for d in (dominios_concorrentes or []) if d.strip()]
+    negativos = [n.strip() for n in (termos_negativos or []) if n.strip()]
+    frases = [f.strip() for f in (frases_categoria or []) if f.strip()]
+    comunidades_busca = comunidades or [normalizar_dominio(c) for c in COMUNIDADES_PADRAO]
 
     def buscar(q, pags=1, per=periodo, tipo="search"):
         res = _buscador(q, serper_key, pais, idioma, pags, per, tipo)
@@ -959,7 +1000,7 @@ def executar(
     # 1a. Web (uma busca para todos os termos)
     if termos:
         log("Buscando menções na web", 0.03)
-        for r in buscar(montar_query(termos, dominio_cliente, excluir), paginas):
+        for r in buscar(montar_query(termos, dominio_cliente, excluir, negativos=negativos), paginas):
             registrar(r, "Web", termos)
 
     # 1b. Notícias (RSS grátis)
@@ -982,11 +1023,48 @@ def executar(
     if termos and comunidades:
         log("Buscando em comunidades", 0.12)
         for r in buscar(query_comunidades(termos, comunidades), 1):
-            if eh_comunidade(urlparse(r.get("url", "")).netloc):
-                registrar(r, "Comunidade", termos, filtrar_excluidos=False)
+            if not eh_comunidade(urlparse(r.get("url", "")).netloc):
+                continue
+            texto = (r.get("titulo", "") + " " + r.get("snippet", ""))
+            if negativos and not menciona(texto, termos, negativos) and menciona(texto, termos):
+                continue  # só aparece por causa de um termo negativo (ex.: OpenSmiles)
+            registrar(r, "Comunidade", termos, filtrar_excluidos=False)
 
-    # 1d. Concorrentes (prospects)
-    if concorrentes:
+    def eh_comunidade_busca(host: str) -> bool:
+        return any(pertence_ao_dominio(host, c) for c in comunidades_busca)
+
+    # 1c2. Concorrentes nas comunidades (para comparar o que dizem de cada marca)
+    if concorrentes and comunidades_concorrentes:
+        log("Buscando concorrentes nas comunidades", 0.13)
+        for r in buscar(query_comunidades(concorrentes, comunidades_busca), 1):
+            url = r.get("url", "")
+            host = urlparse(url).netloc
+            if not eh_comunidade_busca(host) or url in achados or ignorado(url, host):
+                continue
+            texto = r.get("titulo", "") + " " + r.get("snippet", "")
+            if menciona(texto, termos, negativos):
+                continue  # cita o cliente: já entra como menção da marca
+            marcas = menciona(texto, concorrentes)
+            if marcas:
+                achados[url] = {**r, "termos_busca": set(), "fonte": {"Comunidade (concorrente)"},
+                                "marcas": marcas}
+
+    # 1c3. Conversas da categoria (perguntas do nicho que não citam a marca)
+    if frases:
+        log("Buscando conversas da categoria", 0.14)
+        for r in buscar(query_comunidades(frases, comunidades_busca), 1):
+            url = r.get("url", "")
+            host = urlparse(url).netloc
+            if not eh_comunidade_busca(host) or url in achados or ignorado(url, host):
+                continue
+            texto = r.get("titulo", "") + " " + r.get("snippet", "")
+            if menciona(texto, termos, negativos):
+                continue
+            achados[url] = {**r, "termos_busca": set(), "fonte": {"Categoria"},
+                            "marcas": menciona(texto, concorrentes)}
+
+    # 1d. Concorrentes (prospects, versão antiga; o link gap substitui)
+    if concorrentes and buscar_prospects:
         log("Buscando menções a concorrentes", 0.16)
         excl_conc = [dominio_cliente] + dominios_concorrentes + excluir
         for r in buscar(montar_query(concorrentes, "", excl_conc), paginas_concorrentes):
@@ -1009,9 +1087,11 @@ def executar(
     analises: dict[str, AnalisePagina] = {}
 
     def analisar(u):
-        if achados[u].get("nao_resolvido"):
+        f = achados[u]["fonte"]
+        if achados[u].get("nao_resolvido") or f & {"Comunidade (concorrente)", "Categoria"}:
             return AnalisePagina()
-        return analisar_pagina(u, dominio_cliente, termos, termos_concorrentes=concorrentes)
+        return analisar_pagina(u, dominio_cliente, termos, termos_concorrentes=concorrentes,
+                               termos_negativos=negativos)
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futs = {ex.submit(analisar, u): u for u in urls}
@@ -1030,6 +1110,10 @@ def executar(
         a, fontes = analises[u], achados[u]["fonte"]
         if achados[u].get("nao_resolvido"):
             status[u] = ST_NOTICIA_NR
+        elif "Categoria" in fontes:
+            status[u] = ST_CATEGORIA
+        elif "Comunidade (concorrente)" in fontes:
+            status[u] = ST_COMUNIDADE_CONC
         elif "Comunidade" in fontes or eh_comunidade(urlparse(u).netloc):
             status[u] = ST_COMUNIDADE
         else:
@@ -1053,7 +1137,8 @@ def executar(
 
     # 5. Contatos do site (não faz sentido para comunidades)
     contatos: dict[str, Contatos] = {}
-    dominios_contato = sorted({dominio_de(u) for u in urls if status[u] != ST_COMUNIDADE})
+    SOCIAIS = {ST_COMUNIDADE, ST_CATEGORIA, ST_COMUNIDADE_CONC}
+    dominios_contato = sorted({dominio_de(u) for u in urls if status[u] not in SOCIAIS})
     if puxar_contatos and dominios_contato:
         por_dominio: dict[str, list] = {}
         for u in urls:
@@ -1075,7 +1160,7 @@ def executar(
         pares_novos: set[tuple] = set()
         for u in urls:
             a = analises[u]
-            if status[u] == ST_COMUNIDADE or not (a.autor or a.autor_url):
+            if status[u] in SOCIAIS or not (a.autor or a.autor_url):
                 continue
             chave = (dominio_de(u), a.autor)
             if u not in urls_conhecidas:
@@ -1164,7 +1249,11 @@ def executar(
             "url": u,
             "titulo": r.get("titulo", ""),
             "termos_encontrados": ", ".join(a.termos_encontrados),
-            "concorrentes_citados": ", ".join(a.concorrentes_citados),
+            "concorrentes_citados": ", ".join(a.concorrentes_citados or r.get("marcas") or (
+                menciona(r.get("titulo", "") + " " + r.get("snippet", ""), concorrentes)
+                if status[u] == ST_COMUNIDADE else [])),
+            "marca": (", ".join(r.get("marcas") or []) if status[u] in (ST_COMUNIDADE_CONC, ST_CATEGORIA)
+                      else ""),
             "termos_busca": ", ".join(sorted(r["termos_busca"])),
             "fonte": ", ".join(sorted(r["fonte"])),
             "data_google": r.get("data", ""),
